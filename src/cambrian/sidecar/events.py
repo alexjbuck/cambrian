@@ -36,6 +36,7 @@ __all__ = [
     "Event",
     "EventType",
     "TableStateRow",
+    "applied_committed_ids",
     "committed_migrations",
     "latest_event",
     "table_states_for_event",
@@ -272,21 +273,70 @@ def latest_event(
 
 
 def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigration]:
-    """Return every ``commit`` event ordered oldest-first."""
+    """Return every committed migration currently live (commit not later uncommitted).
+
+    Ordered oldest-first by the *commit* event's timestamp. A migration that
+    was committed then uncommitted is excluded; the audit trail retains both
+    events but the working set is the commits without a later uncommit.
+    """
     arrow = _scan_events(catalog, namespace)
     if arrow.num_rows == 0:
         return []
 
-    rows = [r for r in arrow.to_pylist() if r["event_type"] == "commit"]
-    rows.sort(key=lambda r: r["event_ts"])
+    latest_by_id: dict[str, dict] = {}
+    for r in arrow.to_pylist():
+        if r["event_type"] not in {"commit", "uncommit"}:
+            continue
+        existing = latest_by_id.get(r["migration_id"])
+        if existing is None or r["event_ts"] > existing["event_ts"]:
+            latest_by_id[r["migration_id"]] = r
+
+    live = [r for r in latest_by_id.values() if r["event_type"] == "commit"]
+    live.sort(key=lambda r: r["event_ts"])
     return [
         CommittedMigration(
             migration_id=r["migration_id"],
             event_id=r["event_id"],
             event_ts=r["event_ts"],
         )
-        for r in rows
+        for r in live
     ]
+
+
+def applied_committed_ids(catalog: Catalog, namespace: str) -> dict[str, str]:
+    """Return ``{migration_id: migration_hash}`` for every committed migration applied.
+
+    A migration is "applied" if its latest ``apply`` or ``commit`` event is
+    newer than the latest ``uncommit`` event (or there is no uncommit). The
+    ``commit`` event is the immutable hash anchor written at the moment a
+    migration was promoted from ``current.sql``; ``apply`` events written
+    during later cross-checkout replay are also honored.
+    """
+    arrow = _scan_events(catalog, namespace)
+    if arrow.num_rows == 0:
+        return {}
+
+    latest_anchor: dict[str, dict] = {}
+    latest_uncommit_ts: dict[str, object] = {}
+    for r in arrow.to_pylist():
+        if r["migration_id"] == "current":
+            continue
+        if r["event_type"] in ("apply", "commit"):
+            existing = latest_anchor.get(r["migration_id"])
+            if existing is None or r["event_ts"] > existing["event_ts"]:
+                latest_anchor[r["migration_id"]] = r
+        elif r["event_type"] == "uncommit":
+            existing_ts = latest_uncommit_ts.get(r["migration_id"])
+            if existing_ts is None or r["event_ts"] > existing_ts:
+                latest_uncommit_ts[r["migration_id"]] = r["event_ts"]
+
+    out: dict[str, str] = {}
+    for migration_id, row in latest_anchor.items():
+        uncommit_ts = latest_uncommit_ts.get(migration_id)
+        if uncommit_ts is not None and uncommit_ts > row["event_ts"]:
+            continue
+        out[migration_id] = row["migration_hash"]
+    return out
 
 
 def table_states_for_event(

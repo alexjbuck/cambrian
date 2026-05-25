@@ -30,6 +30,7 @@ from cambrian.catalog import load_catalog
 from cambrian.errors import (
     CambrianError,
     ExternalWriteDetectedError,
+    IllegalStateError,
     MigrationNotFoundError,
 )
 from cambrian.iceberg.affected import (
@@ -40,6 +41,7 @@ from cambrian.iceberg.checkpoint import Checkpoint, capture, pin
 from cambrian.iceberg.txn import restore_pointers
 from cambrian.sidecar.events import (
     TableStateRow,
+    applied_committed_ids,
     latest_event,
     table_states_for_event,
     write_event,
@@ -57,10 +59,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ApplyResult",
+    "CommittedApplyResult",
     "ResetResult",
     "StatementResult",
     "apply_idempotent",
     "apply_reset",
+    "replay_committed",
     "rollback_to_last_checkpoint",
 ]
 
@@ -97,34 +101,59 @@ class ApplyResult:
     error: str | None = None
 
 
+@dataclass
+class CommittedApplyResult:
+    """Outcome of replaying a single committed migration."""
+
+    migration_id: str
+    status: str
+    migration_hash: str
+    event_id: str | None = None
+    error: str | None = None
+
+
 def apply_idempotent(
     config: CambrianConfig,
     *,
     allow_partial: bool = False,
     actor: str | None = None,
 ) -> ApplyResult:
-    """Apply ``current.sql`` once in idempotent mode.
+    """Apply committed migrations + ``current.sql`` in idempotent mode.
 
     Steps:
 
-    1. Expand includes + hash.
-    2. Load catalog; ``ensure_current`` on the sidecar.
-    3. Check the last ``apply`` event for ``migration_id="current"``. If its
+    1. Replay any committed migrations not yet present in the events log
+       (post-hoc edit detection refuses on hash mismatch with a prior
+       apply event for that migration_id).
+    2. Expand ``current.sql`` + hash.
+    3. Load catalog; ``ensure_current`` on the sidecar.
+    4. Check the last ``apply`` event for ``migration_id="current"``. If its
        ``migration_hash`` matches the new one: no-op.
-    4. Parse all statements via :class:`CambrianSpark`.
-    5. For each statement: capture pre-state, dispatch, capture post-state.
-    6. Emit one ``apply`` event with the full expanded SQL and N
+    5. Parse all statements via :class:`CambrianSpark`.
+    6. For each statement: capture pre-state, dispatch, capture post-state.
+    7. Emit one ``apply`` event with the full expanded SQL and N
        ``table_states`` rows.
 
     Raises:
         MigrationNotFoundError: ``current.sql`` doesn't exist.
+        IllegalStateError: a committed file's content diverges from the
+            hash recorded in a prior apply event (post-hoc edit).
         CambrianError: Various — see :mod:`cambrian.errors`.
     """
-    current_sql_path = _resolve_current_sql(config)
-    expanded = expand(current_sql_path)
     catalog = load_catalog(config)
     state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
     namespace = state.sidecar_namespace
+
+    replay_committed(
+        config,
+        catalog=catalog,
+        namespace=namespace,
+        allow_partial=allow_partial,
+        actor=actor,
+    )
+
+    current_sql_path = _resolve_current_sql(config)
+    expanded = expand(current_sql_path)
 
     last = latest_event(catalog, namespace, event_type="apply", migration_id="current")
     if last is not None and last.migration_hash == expanded.hash:
@@ -225,6 +254,170 @@ RESET_LAST_RESORT_HINT = (
     "(e.g. add ``IF EXISTS`` / ``IF NOT EXISTS``); reset is the relief "
     "valve, not the recommended path."
 )
+
+
+def replay_committed(
+    config: CambrianConfig,
+    *,
+    catalog: Catalog,
+    namespace: str,
+    allow_partial: bool = False,
+    actor: str | None = None,
+) -> list[CommittedApplyResult]:
+    """Replay every committed migration not yet recorded in the events log.
+
+    Walks ``committed/`` lexicographically. For each ``NNNN_<slug>.sql``:
+
+    * If a prior ``apply`` event exists for that ``migration_id``:
+      - hash matches → skip (already applied);
+      - hash mismatch → refuse with :class:`IllegalStateError`
+        (post-hoc edit of a committed file).
+    * Otherwise dispatch the SQL via the same path used for ``current.sql``
+      and emit an ``apply`` event keyed on the migration_id.
+
+    Returns one :class:`CommittedApplyResult` per file processed.
+    """
+    from cambrian.migrate.commit import discover_committed_files
+
+    migrations_dir = Path(config.migrations.dir).resolve()
+    committed_dir = migrations_dir / "committed"
+    files = discover_committed_files(committed_dir)
+    if not files:
+        return []
+
+    applied = applied_committed_ids(catalog, namespace)
+    results: list[CommittedApplyResult] = []
+
+    for cf in files:
+        text = cf.path.read_text(encoding="utf-8")
+        digest = _sha256_hex(text)
+
+        prior_hash = applied.get(cf.migration_id)
+        if prior_hash is not None:
+            if prior_hash != digest:
+                raise IllegalStateError(
+                    f"committed file {cf.path.name} has been edited since it was applied "
+                    f"(recorded hash {prior_hash[:12]}…, current hash {digest[:12]}…). "
+                    "Committed migrations are immutable history — restore the file from "
+                    "git or run `cambrian sync` to reconcile against the catalog."
+                )
+            results.append(
+                CommittedApplyResult(
+                    migration_id=cf.migration_id,
+                    status="unchanged",
+                    migration_hash=digest,
+                )
+            )
+            continue
+
+        result = _apply_one_committed_text(
+            catalog,
+            namespace,
+            migration_id=cf.migration_id,
+            text=text,
+            digest=digest,
+            sources=[cf.path],
+            allow_partial=allow_partial,
+            actor=actor,
+        )
+        results.append(
+            CommittedApplyResult(
+                migration_id=cf.migration_id,
+                status=result.status,
+                migration_hash=result.migration_hash,
+                event_id=result.event_id,
+                error=result.error,
+            )
+        )
+        if result.error is not None and not allow_partial:
+            raise IllegalStateError(
+                f"failed replaying committed migration {cf.migration_id}: {result.error}"
+            )
+    return results
+
+
+def _sha256_hex(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _apply_one_committed_text(
+    catalog: Catalog,
+    namespace: str,
+    *,
+    migration_id: str,
+    text: str,
+    digest: str,
+    sources: list[Path],
+    allow_partial: bool,
+    actor: str | None,
+) -> ApplyResult:
+    """Dispatch one committed migration's SQL and emit an ``apply`` event for it.
+
+    Mirrors the body of :func:`apply_idempotent` but keyed on a stable
+    ``migration_id`` (the ``NNNN_<slug>`` form) rather than ``"current"``.
+    """
+    statements_raw = sqlglot.parse(text, dialect=CambrianSpark)
+    statements = [s for s in statements_raw if s is not None]
+    per_stmt_tables = affected_tables_with_overrides(text, statements)
+
+    state_by_ident: dict[str, _TableStateAccumulator] = {}
+    for ident in _unique_tables(per_stmt_tables):
+        state_by_ident[str(ident)] = _capture_pre(catalog, ident)
+
+    statement_results: list[StatementResult] = []
+    overall_error: str | None = None
+    fatal_error: CambrianError | None = None
+
+    for stmt, tables in zip(statements, per_stmt_tables, strict=True):
+        try:
+            result = dispatch(catalog, stmt)
+            statement_results.append(
+                StatementResult(
+                    sql=stmt.sql(),
+                    notes=result.notes,
+                    affected_tables=tables or result.affected_tables,
+                )
+            )
+        except CambrianError as err:
+            statement_results.append(
+                StatementResult(sql=stmt.sql(), affected_tables=tables, error=str(err))
+            )
+            overall_error = str(err)
+            if not allow_partial:
+                fatal_error = err
+                break
+
+    for acc in state_by_ident.values():
+        acc.capture_post(catalog)
+
+    status = "applied" if overall_error is None else "partial"
+
+    notes = _summarise(statement_results, status)
+    event_id = write_event(
+        catalog,
+        namespace,
+        event_type="apply",
+        migration_id=migration_id,
+        migration_hash=digest,
+        migration_sql=text,
+        actor=actor or _default_actor(),
+        notes=notes,
+        table_states=[acc.to_row() for acc in state_by_ident.values()],
+    )
+
+    if fatal_error is not None:
+        raise fatal_error
+
+    return ApplyResult(
+        status=status,
+        migration_hash=digest,
+        sources=sources,
+        statements=statement_results,
+        event_id=event_id,
+        error=overall_error,
+    )
 
 
 # ---------------------------------------------------------------------------
