@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Tooling caches
+.ruff_cache/
+.ty_cache/
+.pytest_cache/
+.hypothesis/
+
+# OS noise
+.DS_Store

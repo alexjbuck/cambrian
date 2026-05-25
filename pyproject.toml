@@ -1,17 +1,79 @@
 [project]
 name = "cambrian"
 version = "0.1.0"
-description = "Add your description here"
+description = "SQL-driven migration runner for Apache Iceberg tables, powered by PyIceberg."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Alex Buck", email = "abuck@spear.ai" }
 ]
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Version Control",
+]
+dependencies = [
+    "pyarrow>=24.0.0",
+    "pydantic>=2.13.4",
+    "pyiceberg>=0.11.1",
+    "sqlglot>=30.8.0",
+    "typer>=0.25.1",
+    "watchfiles>=1.2.0",
+]
 
 [project.scripts]
-cambrian = "cambrian:main"
+cambrian = "cambrian.cli:app"
+
+[project.urls]
+Repository = "https://github.com/alexjbuck/cambrian"
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.workspace]
+# Declare cambrian as its own workspace root so it doesn't get pulled into
+# any parent pyproject.toml's workspace.
+members = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.src]
+include = ["src"]
+
+[tool.ty.rules]
+# Strict by default in src/; per-file relaxations live alongside the offending code.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.152.9",
+    "pytest>=9.0.3",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.15.14",
+    "syrupy>=5.2.0",
+    "ty>=0.0.39",
+]
