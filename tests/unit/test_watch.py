@@ -1,0 +1,228 @@
+"""Unit tests for ``cambrian.migrate.watch``.
+
+These don't touch the filesystem (beyond ``tmp_path``) or the catalog —
+the runner is monkeypatched, and the watcher generator is a fake async
+iterator yielding pre-baked batches.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
+
+import pytest
+from watchfiles import Change
+
+import cambrian.migrate.watch as watch_mod
+from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, MigrationsConfig
+from cambrian.errors import CambrianError
+from cambrian.migrate.runner import ApplyResult
+
+
+def _make_config(tmp_path: Path, *, debounce_ms: int = 50) -> CambrianConfig:
+    return CambrianConfig(
+        catalog=CatalogConfig(type="sql", uri="sqlite:///:memory:"),
+        migrations=MigrationsConfig(dir=str(tmp_path / "migrations")),
+        dev=DevConfig(debounce_ms=debounce_ms),
+    )
+
+
+class _FakeWatcher:
+    """Async iterator that yields a fixed sequence of ``awatch`` batches."""
+
+    def __init__(self, batches: Sequence[set[tuple[Change, str]]]) -> None:
+        self._batches = list(batches)
+
+    def __call__(
+        self, paths: Sequence[Path], debounce_ms: int, stop_event: object
+    ) -> AsyncIterator[set[tuple[Change, str]]]:
+        # paths and debounce_ms are recorded for assertion.
+        self.last_paths = list(paths)
+        self.last_debounce_ms = debounce_ms
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[set[tuple[Change, str]]]:
+        for batch in self._batches:
+            # Yield to the event loop so to_thread-scheduled callbacks can fire.
+            await asyncio.sleep(0)
+            yield batch
+
+
+def _stub_apply_factory(call_log: list[CambrianConfig]) -> object:
+    """Build a stub ``apply_idempotent`` that records calls and returns success."""
+
+    def _stub(
+        config: CambrianConfig, *, allow_partial: bool = False, actor: str | None = None
+    ) -> ApplyResult:
+        del allow_partial, actor
+        call_log.append(config)
+        return ApplyResult(
+            status="applied",
+            migration_hash="deadbeef" + "0" * 56,
+            sources=[],
+            statements=[],
+            event_id="evt-" + str(len(call_log)),
+        )
+
+    return _stub
+
+
+def test_watch_calls_apply_once_per_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two debounced batches → exactly two applies (plus an initial)."""
+    cfg = _make_config(tmp_path)
+    calls: list[CambrianConfig] = []
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _stub_apply_factory(calls))
+
+    fake = _FakeWatcher(
+        [
+            {(Change.modified, str(tmp_path / "migrations" / "current.sql"))},
+            {(Change.modified, str(tmp_path / "migrations" / "current.sql"))},
+        ]
+    )
+
+    events: list[watch_mod.WatchEvent] = []
+
+    async def _run() -> None:
+        await watch_mod.watch(
+            cfg,
+            watcher_factory=fake,
+            on_event=events.append,
+        )
+
+    asyncio.run(_run())
+
+    # 1 initial + 2 batches.
+    assert len(calls) == 3
+    # debounce_ms forwarded.
+    assert fake.last_debounce_ms == cfg.dev.debounce_ms
+    # We observed startup + 3 status events.
+    kinds = [e.kind for e in events]
+    assert "startup" in kinds
+    assert kinds.count("applied") == 3
+
+
+def test_watch_debounce_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit ``debounce_ms`` overrides config."""
+    cfg = _make_config(tmp_path, debounce_ms=500)
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _stub_apply_factory([]))
+
+    fake = _FakeWatcher([])
+
+    async def _run() -> None:
+        await watch_mod.watch(cfg, debounce_ms=42, watcher_factory=fake, initial_apply=False)
+
+    asyncio.run(_run())
+    assert fake.last_debounce_ms == 42
+
+
+def test_watch_parse_error_keeps_loop_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CambrianError during apply is reported and the next batch still applies."""
+    cfg = _make_config(tmp_path)
+    call_count = {"n": 0}
+
+    def _flaky_apply(
+        config: CambrianConfig, *, allow_partial: bool = False, actor: str | None = None
+    ) -> ApplyResult:
+        del config, allow_partial, actor
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise CambrianError("synthetic parse failure")
+        return ApplyResult(
+            status="applied",
+            migration_hash="cafe" + "0" * 60,
+            sources=[],
+        )
+
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _flaky_apply)
+
+    fake = _FakeWatcher(
+        [
+            {(Change.modified, "a.sql")},
+            {(Change.modified, "b.sql")},
+        ]
+    )
+    events: list[watch_mod.WatchEvent] = []
+
+    async def _run() -> None:
+        await watch_mod.watch(cfg, watcher_factory=fake, on_event=events.append)
+
+    asyncio.run(_run())
+
+    kinds = [e.kind for e in events]
+    assert "error" in kinds
+    # The third call (second batch) succeeded — loop didn't die on the error.
+    assert call_count["n"] == 3
+    assert kinds.count("applied") == 2
+
+
+def test_watch_initial_apply_can_be_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_config(tmp_path)
+    calls: list[CambrianConfig] = []
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _stub_apply_factory(calls))
+
+    fake = _FakeWatcher([])
+
+    async def _run() -> None:
+        await watch_mod.watch(cfg, watcher_factory=fake, initial_apply=False)
+
+    asyncio.run(_run())
+    assert calls == []
+
+
+def test_watch_use_reset_without_pr_b_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asking for reset mode in PR-a's build is a clean CambrianError."""
+    cfg = _make_config(tmp_path)
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _stub_apply_factory([]))
+    # Ensure no apply_reset is exposed on runner (PR-a state).
+    from cambrian.migrate import runner
+
+    monkeypatch.delattr(runner, "apply_reset", raising=False)
+
+    fake = _FakeWatcher([])
+
+    events: list[watch_mod.WatchEvent] = []
+
+    async def _run() -> None:
+        await watch_mod.watch(
+            cfg,
+            watcher_factory=fake,
+            use_reset=True,
+            on_event=events.append,
+        )
+
+    asyncio.run(_run())
+    # Initial apply hits the gate and is reported as error; loop runs to
+    # exhaustion of the (empty) fake watcher.
+    assert any(e.kind == "error" for e in events)
+
+
+def test_watch_resolves_targets_from_includes(tmp_path: Path) -> None:
+    """``_resolve_watch_targets`` returns the directories of every included file."""
+    migrations = tmp_path / "migrations"
+    nested = migrations / "current"
+    nested.mkdir(parents=True)
+    (nested / "a.sql").write_text("CREATE NAMESPACE x;\n", encoding="utf-8")
+    (nested / "b.sql").write_text("CREATE NAMESPACE y;\n", encoding="utf-8")
+    (migrations / "current.sql").write_text("--! include current/*.sql\n", encoding="utf-8")
+
+    cfg = _make_config(tmp_path)
+    targets = watch_mod._resolve_watch_targets(cfg)  # type: ignore[attr-defined]
+    # Both the root migrations dir (for current.sql) and the current/ dir
+    # (for the includes) end up in the set.
+    resolved = {p.resolve() for p in targets}
+    assert migrations.resolve() in resolved
+    assert nested.resolve() in resolved
+
+
+def test_watch_resolves_falls_back_when_no_current_sql(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    # No current.sql exists.
+    targets = watch_mod._resolve_watch_targets(cfg)  # type: ignore[attr-defined]
+    assert targets == [(tmp_path / "migrations").resolve()]

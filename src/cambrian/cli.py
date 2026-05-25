@@ -23,6 +23,7 @@ from cambrian.errors import (
     SidecarVersionAheadError,
 )
 from cambrian.migrate import apply_idempotent
+from cambrian.migrate.watch import watch as _watch_loop
 from cambrian.sidecar.events import committed_migrations, latest_event
 from cambrian.sidecar.schema import CAMBRIAN_SIDECAR_VERSION
 from cambrian.sidecar.selfmigrate import ensure_current
@@ -349,6 +350,75 @@ def apply_command(
     # Partial / errored apply: surface non-zero exit so CI fails loud.
     if result.status == "partial" or result.error is not None:
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# `cambrian watch`
+# ---------------------------------------------------------------------------
+
+
+@app.command("watch")
+def watch_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    debounce_ms: Annotated[
+        int | None,
+        typer.Option(
+            "--debounce-ms",
+            help=(
+                "Override ``[dev].debounce_ms`` for this invocation. "
+                "Milliseconds of quiet time required before a batch of edits triggers an apply."
+            ),
+        ),
+    ] = None,
+    allow_partial: Annotated[
+        bool,
+        typer.Option(
+            "--allow-partial",
+            help="Continue past statement failures and emit a partial-success event.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one JSON line per watch event."),
+    ] = False,
+) -> None:
+    """Watch the migrations directory and re-apply ``current.sql`` on every change.
+
+    Idempotent-mode-only. Reset mode lands in M6's second PR (the same
+    binary, but ``--reset`` and ``[dev].mode = "reset"`` aren't honoured
+    at this milestone). On a parse or dispatch error, the loop reports
+    the error and keeps watching — the next save should fix things.
+    """
+    import asyncio as _asyncio
+
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        _asyncio.run(
+            _watch_loop(
+                cfg,
+                debounce_ms=debounce_ms,
+                allow_partial=allow_partial,
+                json_output=as_json,
+            )
+        )
+    except KeyboardInterrupt:
+        # Typer's default behaviour on Ctrl-C is fine; we just want to make
+        # sure we don't dump a traceback at the user.
+        raise typer.Exit(code=0) from None
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 def _apply_payload(result: Any) -> dict[str, Any]:
