@@ -16,7 +16,9 @@ String values in TOML support ``${VAR}`` substitution against the process
 environment at load time. This is intentionally restricted to strings (TOML
 ints/bools are passed through as-is). Missing env vars raise
 :class:`MissingEnvVarError` listing every unset name in one shot so CI runs
-can see all that's broken in a single failure.
+can see all that's broken in a single failure. To emit a literal ``${VAR}``
+without interpolating, double the dollar: ``$${VAR}`` is rewritten to
+``${VAR}`` after substitution (the standard make-style escape).
 """
 
 from __future__ import annotations
@@ -49,31 +51,45 @@ __all__ = [
 # Env interpolation
 # ---------------------------------------------------------------------------
 
-_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# Two alternatives matched in one pass so a literal ``$${VAR}`` is consumed
+# as a unit and the leading ``$`` of ``${VAR}`` next to it can't be mistaken
+# for an escape. Without the single-pass form, ``$${VAR}`` would
+# first-pass-substitute the inner ``${VAR}``, defeating the escape.
+_ENV_VAR_RE = re.compile(r"\$\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _interpolate_env(value: Any, missing: list[str]) -> Any:
+def _interpolate_env(
+    value: Any,
+    missing: list[tuple[str, str]],
+    path: tuple[str, ...] = (),
+) -> Any:
     """Recursively substitute ``${VAR}`` references inside *value*.
 
-    Strings are scanned; unset env vars are appended to *missing* instead of
-    raising so the caller can report every unset name at once. Non-string
-    leaves are returned untouched. Lists and dicts are walked.
+    Strings are scanned; unset env vars are appended to *missing* as
+    ``(varname, dotted-field-path)`` so the caller can report every unset
+    name + the field it was referenced from. Non-string leaves are returned
+    untouched. Lists and dicts are walked. A literal ``$${VAR}`` is rewritten
+    to ``${VAR}`` without consulting the environment (make-style escape).
     """
     if isinstance(value, str):
+        field_path = ".".join(path) or "<root>"
 
         def _sub(match: re.Match[str]) -> str:
-            name = match.group(1)
+            escaped, name = match.group(1), match.group(2)
+            if escaped is not None:
+                return f"${{{escaped}}}"
+            assert name is not None
             env_value = os.environ.get(name)
             if env_value is None:
-                missing.append(name)
+                missing.append((name, field_path))
                 return match.group(0)
             return env_value
 
         return _ENV_VAR_RE.sub(_sub, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env(v, missing) for k, v in value.items()}
+        return {k: _interpolate_env(v, missing, (*path, str(k))) for k, v in value.items()}
     if isinstance(value, list):
-        return [_interpolate_env(item, missing) for item in value]
+        return [_interpolate_env(item, missing, (*path, f"[{i}]")) for i, item in enumerate(value)]
     return value
 
 
@@ -176,12 +192,17 @@ def load_config(path: Path) -> CambrianConfig:
     except tomllib.TOMLDecodeError as exc:
         raise InvalidConfigError(f"Failed to parse TOML at {path}: {exc}") from exc
 
-    missing: list[str] = []
+    missing: list[tuple[str, str]] = []
     interpolated = _interpolate_env(raw, missing)
     if missing:
+        # Dedupe on (var, field) so a single reference doesn't print twice if
+        # somehow it was visited more than once, but two distinct refs to the
+        # same var from different fields are surfaced separately.
         unique = sorted(set(missing))
-        joined = ", ".join(unique)
-        raise MissingEnvVarError(f"Config references unset environment variable(s): {joined}")
+        joined = "; ".join(f"${{{var}}} (referenced from {field})" for var, field in unique)
+        raise MissingEnvVarError(
+            f"Config at {path} references unset environment variable(s): {joined}"
+        )
 
     try:
         return CambrianConfig.model_validate(interpolated)

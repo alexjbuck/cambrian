@@ -83,6 +83,31 @@ jobs:
         # on exit, so no separate compose step is needed.
         run: uv run pytest tests/integration -v
 
+      - name: V1 smoke - cambrian apply --json
+        # Re-bring up the stack (pytest's session fixture tore it down on
+        # exit) and exercise the production code path end-to-end: the same
+        # command and JSON-parse pipeline a CI deploy would run.
+        env:
+          UV_PROJECT_ENVIRONMENT: .venv
+          SMOKE_TOML: tests/fixtures/v1-smoke/cambrian.toml
+        run: |
+          docker compose -f docker/compose.yml up -d
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:8181/health >/dev/null 2>&1 \
+              && docker compose -f docker/compose.yml ps -a \
+                  --format '{{.Service}} {{.ExitCode}}' \
+                  | grep -q '^bootstrap 0$'; then
+              break
+            fi
+            sleep 2
+          done
+          uv run cambrian init --path "$SMOKE_TOML"
+          uv run cambrian apply --json --path "$SMOKE_TOML" | tee /tmp/apply.json
+          status=$(jq -r .status /tmp/apply.json)
+          test "$status" = "applied" || test "$status" = "unchanged"
+          uv run cambrian apply --json --path "$SMOKE_TOML" | tee /tmp/apply2.json
+          test "$(jq -r .status /tmp/apply2.json)" = "unchanged"
+
       - name: Dump compose logs on failure
         if: failure()
         run: docker compose -f docker/compose.yml logs --no-color || true
