@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import sqlglot
 from pyiceberg.exceptions import NoSuchTableError
+from sqlglot import expressions as exp
 
 from cambrian.catalog import load_catalog
 from cambrian.errors import (
@@ -85,23 +86,6 @@ class StatementResult:
 
 
 @dataclass
-class ApplyResult:
-    """The aggregate outcome of an apply.
-
-    ``status`` is one of ``"unchanged"`` (hash matched), ``"applied"``
-    (every statement succeeded), or ``"partial"`` (at least one statement
-    failed but the runner continued under ``allow_partial=True``).
-    """
-
-    status: str
-    migration_hash: str
-    sources: list[Path] = field(default_factory=list)
-    statements: list[StatementResult] = field(default_factory=list)
-    event_id: str | None = None
-    error: str | None = None
-
-
-@dataclass
 class CommittedApplyResult:
     """Outcome of replaying a single committed migration."""
 
@@ -110,6 +94,29 @@ class CommittedApplyResult:
     migration_hash: str
     event_id: str | None = None
     error: str | None = None
+
+
+@dataclass
+class ApplyResult:
+    """The aggregate outcome of an apply.
+
+    ``status`` is one of ``"unchanged"`` (hash matched), ``"applied"``
+    (every statement succeeded), or ``"partial"`` (at least one statement
+    failed but the runner continued under ``allow_partial=True``).
+
+    ``applied_committed`` is the list of committed migrations replayed by
+    this invocation (empty when current.sql is the only thing in flight or
+    the replay was a no-op).
+    """
+
+    status: str
+    migration_hash: str
+    sources: list[Path] = field(default_factory=list)
+    statements: list[StatementResult] = field(default_factory=list)
+    event_id: str | None = None
+    error: str | None = None
+    applied_committed: list[CommittedApplyResult] = field(default_factory=list)
+    migration_id: str = "current"
 
 
 def apply_idempotent(
@@ -144,7 +151,7 @@ def apply_idempotent(
     state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
     namespace = state.sidecar_namespace
 
-    replay_committed(
+    replay_results = replay_committed(
         config,
         catalog=catalog,
         namespace=namespace,
@@ -161,6 +168,7 @@ def apply_idempotent(
             status="unchanged",
             migration_hash=expanded.hash,
             sources=expanded.sources,
+            applied_committed=replay_results,
         )
 
     statements_raw = sqlglot.parse(expanded.text, dialect=CambrianSpark)
@@ -183,7 +191,7 @@ def apply_idempotent(
             result = dispatch(catalog, stmt)
             statement_results.append(
                 StatementResult(
-                    sql=stmt.sql(),
+                    sql=_safe_sql(stmt),
                     notes=result.notes,
                     affected_tables=tables or result.affected_tables,
                 )
@@ -191,7 +199,7 @@ def apply_idempotent(
         except CambrianError as err:
             statement_results.append(
                 StatementResult(
-                    sql=stmt.sql(),
+                    sql=_safe_sql(stmt),
                     affected_tables=tables,
                     error=str(err),
                 )
@@ -241,6 +249,7 @@ def apply_idempotent(
         statements=statement_results,
         event_id=event_id,
         error=overall_error,
+        applied_committed=replay_results,
     )
 
 
@@ -375,14 +384,14 @@ def _apply_one_committed_text(
             result = dispatch(catalog, stmt)
             statement_results.append(
                 StatementResult(
-                    sql=stmt.sql(),
+                    sql=_safe_sql(stmt),
                     notes=result.notes,
                     affected_tables=tables or result.affected_tables,
                 )
             )
         except CambrianError as err:
             statement_results.append(
-                StatementResult(sql=stmt.sql(), affected_tables=tables, error=str(err))
+                StatementResult(sql=_safe_sql(stmt), affected_tables=tables, error=str(err))
             )
             overall_error = str(err)
             if not allow_partial:
@@ -458,6 +467,22 @@ def _summarise(stmts: list[StatementResult], status: str) -> str:
     n = len(stmts)
     errs = sum(1 for s in stmts if s.error)
     return f"status={status} statements={n} errors={errs}"
+
+
+def _safe_sql(stmt: exp.Expression) -> str:
+    """Best-effort ``.sql()`` for an expression.
+
+    sqlglot's generator raises ``ValueError`` for AST nodes it can't render —
+    we extend the Spark dialect with Iceberg-only expressions (``ADD
+    PARTITION FIELD``, ``WRITE ORDERED BY``, etc.) without supplying matching
+    generators because the runner never has to round-trip them. The JSON
+    output, on the other hand, does need *something* to show the user.
+    Fall back to the type name so the audit trail keeps something useful.
+    """
+    try:
+        return stmt.sql()
+    except Exception:
+        return f"<unprintable {type(stmt).__name__}>"
 
 
 def _unique_tables(per_stmt: Iterable[Iterable[TableIdent]]) -> list[TableIdent]:

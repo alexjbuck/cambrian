@@ -669,6 +669,7 @@ def _commit_payload(result: Any) -> dict[str, Any]:
         "migration_id": result.migration_id,
         "committed_path": str(result.committed_path),
         "migration_hash": result.migration_hash,
+        "tag_ref": result.tag_ref,
         "event_id": result.event_id,
         "affected_tables": result.affected_tables,
     }
@@ -678,6 +679,7 @@ def _uncommit_payload(result: Any) -> dict[str, Any]:
     return {
         "migration_id": result.migration_id,
         "restored_path": str(result.restored_path),
+        "restored_to_current": True,
         "event_id": result.event_id,
         "rolled_back_tables": result.rolled_back_tables,
         "skipped_tables": result.skipped_tables,
@@ -787,10 +789,22 @@ def watch_command(
 
 def _apply_payload(result: Any) -> dict[str, Any]:
     return {
+        "mode": "idempotent",
         "status": result.status,
+        "migration_id": result.migration_id,
         "migration_hash": result.migration_hash,
         "event_id": result.event_id,
         "sources": [str(p) for p in result.sources],
+        "applied_committed": [
+            {
+                "migration_id": c.migration_id,
+                "status": c.status,
+                "migration_hash": c.migration_hash,
+                "event_id": c.event_id,
+                "error": c.error,
+            }
+            for c in result.applied_committed
+        ],
         "statements": [
             {
                 "sql": s.sql,

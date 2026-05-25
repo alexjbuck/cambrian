@@ -273,6 +273,47 @@ token = "${CAMBRIAN_MISSING_B}"
     assert "CAMBRIAN_MISSING_B" in message
 
 
+def test_env_interpolation_missing_var_names_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The error message must name BOTH the unset var and the field it was used in."""
+    monkeypatch.delenv("CAMBRIAN_CATALOG_TOKEN", raising=False)
+    path = _write(
+        tmp_path,
+        """
+[catalog]
+type = "rest"
+uri = "http://localhost:8181"
+token = "${CAMBRIAN_CATALOG_TOKEN}"
+""",
+    )
+    with pytest.raises(MissingEnvVarError) as excinfo:
+        load_config(path)
+    message = str(excinfo.value)
+    assert "CAMBRIAN_CATALOG_TOKEN" in message
+    assert "catalog.token" in message
+
+
+def test_env_interpolation_literal_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``$${VAR}`` is rewritten to the literal ``${VAR}`` without interpolation."""
+    monkeypatch.delenv("CAMBRIAN_NOT_SET", raising=False)
+    monkeypatch.setenv("CAMBRIAN_TOKEN", "real")
+    path = _write(
+        tmp_path,
+        """
+[catalog]
+type = "rest"
+uri = "http://localhost:8181"
+warehouse = "literal-$${CAMBRIAN_NOT_SET}-tail"
+token = "${CAMBRIAN_TOKEN}"
+""",
+    )
+    cfg = load_config(path)
+    dumped = cfg.catalog.model_dump()
+    assert dumped["warehouse"] == "literal-${CAMBRIAN_NOT_SET}-tail"
+    assert dumped["token"] == "real"
+
+
 def test_env_interpolation_only_strings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Non-string TOML scalars are passed through untouched."""
     monkeypatch.setenv("CAMBRIAN_DIR", "./from-env-dir")

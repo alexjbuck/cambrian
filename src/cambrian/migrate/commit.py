@@ -105,6 +105,7 @@ class CommitResult:
     migration_hash: str
     event_id: str | None
     affected_tables: list[str] = field(default_factory=list)
+    tag_ref: str = ""
 
 
 @dataclass
@@ -358,6 +359,7 @@ def cambrian_commit(
         migration_hash=expanded.hash,
         event_id=event_id,
         affected_tables=[str(i) for i in idents],
+        tag_ref=tag_name,
     )
 
 
