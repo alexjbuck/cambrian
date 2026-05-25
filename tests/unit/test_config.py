@@ -43,7 +43,6 @@ warehouse = "s3://bucket/"
 [migrations]
 dir = "./my-migs"
 sidecar_namespace = "_my_ns"
-sidecar_table = "my_state"
 
 [dev]
 mode = "reset"
@@ -57,7 +56,6 @@ debounce_ms = 1000
     assert cfg.catalog.uri == "http://localhost:8181"
     assert cfg.migrations.dir == "./my-migs"
     assert cfg.migrations.sidecar_namespace == "_my_ns"
-    assert cfg.migrations.sidecar_table == "my_state"
     assert cfg.dev.mode == "reset"
     assert cfg.dev.watch is False
     assert cfg.dev.debounce_ms == 1000
@@ -78,7 +76,6 @@ uri = "http://localhost:8181"
     assert cfg.migrations == MigrationsConfig()
     assert cfg.migrations.dir == "./migrations"
     assert cfg.migrations.sidecar_namespace == "_cambrian"
-    assert cfg.migrations.sidecar_table == "migration_state"
     assert cfg.migrations.sidecar_catalog is None
     # Dev defaults
     assert cfg.dev == DevConfig()
@@ -104,7 +101,24 @@ dir = "./scripts"
     assert cfg.migrations.dir == "./scripts"
     # Defaults preserved
     assert cfg.migrations.sidecar_namespace == "_cambrian"
-    assert cfg.migrations.sidecar_table == "migration_state"
+
+
+def test_sidecar_table_removed_from_schema(tmp_path: Path) -> None:
+    """The legacy ``sidecar_table`` field was removed in M3; it's now rejected as unknown."""
+    path = _write(
+        tmp_path,
+        """
+[catalog]
+type = "rest"
+uri = "http://localhost:8181"
+
+[migrations]
+sidecar_table = "migration_state"
+""",
+    )
+    with pytest.raises(InvalidConfigError) as excinfo:
+        load_config(path)
+    assert "sidecar_table" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
