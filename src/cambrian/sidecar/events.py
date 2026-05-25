@@ -33,11 +33,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CommittedMigration",
+    "CommittedPayload",
     "Event",
     "EventType",
     "TableStateRow",
     "applied_committed_ids",
     "committed_migrations",
+    "committed_payloads",
     "latest_event",
     "table_states_for_event",
     "write_event",
@@ -84,6 +86,22 @@ class CommittedMigration:
     migration_id: str
     event_id: str
     event_ts: datetime
+
+
+@dataclass(frozen=True)
+class CommittedPayload:
+    """A ``commit`` event with its full SQL payload, for ``cambrian sync``.
+
+    Distinct from :class:`CommittedMigration` because sync needs the
+    ``migration_sql`` and ``migration_hash`` columns; the lightweight view
+    used by ``cambrian status`` doesn't.
+    """
+
+    migration_id: str
+    event_id: str
+    event_ts: datetime
+    migration_sql: str
+    migration_hash: str
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +316,40 @@ def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigr
             migration_id=r["migration_id"],
             event_id=r["event_id"],
             event_ts=r["event_ts"],
+        )
+        for r in live
+    ]
+
+
+def committed_payloads(catalog: Catalog, namespace: str) -> list[CommittedPayload]:
+    """Return every live commit event with its full SQL + hash, oldest-first.
+
+    Like :func:`committed_migrations` but carries the ``migration_sql`` and
+    ``migration_hash`` columns — the payload ``cambrian sync`` writes back to
+    disk. Filters out any commit whose ``migration_id`` has a later
+    ``uncommit`` event (uncommitted migrations shouldn't be re-rehydrated).
+    """
+    arrow = _scan_events(catalog, namespace)
+    if arrow.num_rows == 0:
+        return []
+
+    latest_by_id: dict[str, dict] = {}
+    for r in arrow.to_pylist():
+        if r["event_type"] not in {"commit", "uncommit"}:
+            continue
+        existing = latest_by_id.get(r["migration_id"])
+        if existing is None or r["event_ts"] > existing["event_ts"]:
+            latest_by_id[r["migration_id"]] = r
+
+    live = [r for r in latest_by_id.values() if r["event_type"] == "commit"]
+    live.sort(key=lambda r: r["event_ts"])
+    return [
+        CommittedPayload(
+            migration_id=r["migration_id"],
+            event_id=r["event_id"],
+            event_ts=r["event_ts"],
+            migration_sql=r["migration_sql"],
+            migration_hash=r["migration_hash"],
         )
         for r in live
     ]
