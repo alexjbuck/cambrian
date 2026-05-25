@@ -9,7 +9,17 @@ import apply_idempotent``.
 """
 
 from cambrian.migrate.runner import ApplyResult, StatementResult, apply_idempotent
+from cambrian.migrate.sync import SyncFileResult, SyncResult, cambrian_sync
 from cambrian.migrate.watch import WatchEvent
 from cambrian.migrate.watch import watch as watch_loop
 
-__all__ = ["ApplyResult", "StatementResult", "WatchEvent", "apply_idempotent", "watch_loop"]
+__all__ = [
+    "ApplyResult",
+    "StatementResult",
+    "SyncFileResult",
+    "SyncResult",
+    "WatchEvent",
+    "apply_idempotent",
+    "cambrian_sync",
+    "watch_loop",
+]

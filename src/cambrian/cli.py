@@ -33,6 +33,7 @@ from cambrian.migrate.runner import (
     apply_reset,
     rollback_to_last_checkpoint,
 )
+from cambrian.migrate.sync import SyncResult, cambrian_sync
 from cambrian.migrate.watch import watch as _watch_loop
 from cambrian.sidecar.events import committed_migrations, latest_event
 from cambrian.sidecar.schema import CAMBRIAN_SIDECAR_VERSION
@@ -867,3 +868,172 @@ def _print_reset_human(result: Any) -> None:
         _print_apply_human(result.apply_result)
     if result.error:
         typer.echo(f"error: {result.error}", err=True)
+
+
+# ---------------------------------------------------------------------------
+# `cambrian sync` (alias: `cambrian download`)
+# ---------------------------------------------------------------------------
+
+
+def _sync_payload(result: SyncResult) -> dict[str, Any]:
+    return {
+        "dry_run": result.dry_run,
+        "written": result.written,
+        "overwritten": result.overwritten,
+        "skipped": result.skipped,
+        "refused": result.refused,
+        "discrepancies": result.discrepancies,
+        "files": [
+            {
+                "migration_id": f.migration_id,
+                "path": str(f.path),
+                "status": f.status,
+                "catalog_hash": f.catalog_hash,
+                "local_hash": f.local_hash,
+                "diff": f.diff,
+                "note": f.note,
+            }
+            for f in result.files
+        ],
+    }
+
+
+def _print_sync_human(result: SyncResult) -> None:
+    prefix = "would " if result.dry_run else ""
+    for f in result.files:
+        if f.status == "written":
+            typer.echo(f"{prefix}write     {f.path} ({f.catalog_hash[:12]}…)")
+        elif f.status == "overwritten":
+            typer.echo(f"{prefix}overwrite {f.path} ({f.catalog_hash[:12]}…)")
+        elif f.status == "skipped":
+            typer.echo(f"skip      {f.path} (hash matches)")
+        elif f.status == "refused":
+            typer.echo(f"refuse    {f.path}", err=True)
+            if f.note:
+                typer.echo(f"          {f.note}", err=True)
+            if f.diff:
+                typer.echo(f.diff, err=True)
+        else:
+            typer.echo(f"discrepancy {f.path}", err=True)
+            if f.note:
+                typer.echo(f"            {f.note}", err=True)
+    typer.echo(
+        "summary: "
+        f"written={result.written} "
+        f"overwritten={result.overwritten} "
+        f"skipped={result.skipped} "
+        f"refused={result.refused} "
+        f"discrepancies={result.discrepancies}"
+    )
+
+
+def _sync_impl(
+    path: Path,
+    *,
+    dry_run: bool,
+    diff: bool,
+    force: bool,
+    as_json: bool,
+) -> None:
+    """Shared body for ``sync`` and ``download`` (they're aliases)."""
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = cambrian_sync(cfg, force=force, dry_run=dry_run, diff=diff)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_sync_payload(result), default=str))
+    else:
+        _print_sync_human(result)
+
+    if result.has_refusals:
+        raise typer.Exit(code=EXIT_EXTERNAL_WRITE)
+
+
+@app.command("sync")
+def sync_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Plan only; write nothing to disk.",
+        ),
+    ] = False,
+    diff: Annotated[
+        bool,
+        typer.Option(
+            "--diff",
+            help=(
+                "Print a unified diff of local vs catalog on conflicts. "
+                "Implies --dry-run unless --force is also passed."
+            ),
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Overwrite local committed files that conflict with the catalog.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a single-line JSON summary."),
+    ] = False,
+) -> None:
+    """Rehydrate the local ``committed/`` directory from the catalog.
+
+    Read-only against the catalog: no events are written. Missing files are
+    created, hash-matching files are skipped, and files whose content differs
+    from the catalog row are refused unless ``--force`` is passed. Use
+    ``--diff`` to inspect conflicts; use ``--dry-run`` to plan without
+    touching the filesystem. Exits ``4`` if any conflict was refused so CI
+    can fail loud on a drifted checkout.
+    """
+    _sync_impl(path, dry_run=dry_run, diff=diff, force=force, as_json=as_json)
+
+
+@app.command("download")
+def download_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Plan only; write nothing to disk."),
+    ] = False,
+    diff: Annotated[
+        bool,
+        typer.Option(
+            "--diff",
+            help="Print a unified diff of local vs catalog on conflicts.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite local committed files on conflict."),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a single-line JSON summary."),
+    ] = False,
+) -> None:
+    """Alias for ``cambrian sync``. Same semantics; chosen for muscle memory.
+
+    Postgres-land tools tend to spell this ``download`` (sqitch) or ``sync``
+    (graphile-migrate); we accept both. The catalog is the source of truth
+    and both commands rehydrate the local ``committed/`` directory from it.
+    """
+    _sync_impl(path, dry_run=dry_run, diff=diff, force=force, as_json=as_json)
