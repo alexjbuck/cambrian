@@ -3,9 +3,44 @@
 Each exception carries a user-facing hint or doc link. Populated as milestones land.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+
 
 class CambrianError(Exception):
     """Base class for all cambrian exceptions."""
+
+
+class IncludeNotFoundError(CambrianError):
+    """Raised when an ``--! include`` directive references a path that doesn't exist.
+
+    Carries the directive-relative path and the absolute resolution attempt so the
+    error message tells the user both what they typed and what cambrian looked for.
+    """
+
+    def __init__(self, *, directive: str, resolved: Path, source: Path) -> None:
+        self.directive = directive
+        self.resolved = resolved
+        self.source = source
+        super().__init__(
+            f"include directive '--! include {directive}' in {source} does not match any "
+            f"file (looked at {resolved})"
+        )
+
+
+class CircularIncludeError(CambrianError):
+    """Raised when ``--! include`` resolution forms a cycle.
+
+    ``cycle`` is the path of files visited before the cycle was detected, ending with
+    the file that would have re-entered. Reported in include order so the user can
+    trace which file pulled which.
+    """
+
+    def __init__(self, cycle: list[Path]) -> None:
+        self.cycle = list(cycle)
+        chain = " -> ".join(str(p) for p in self.cycle)
+        super().__init__(f"circular include detected: {chain}")
 
 
 class ConfigNotFoundError(CambrianError):
