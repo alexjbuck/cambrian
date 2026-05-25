@@ -2,11 +2,11 @@
 
 Exercises the catalog-truth-source contract end-to-end against Lakekeeper:
 
-* cross-instance roundtrip: ``commit`` from one ``migrations/`` directory,
-  ``sync`` rehydrates a fresh empty ``migrations/`` directory pointed at the
+* cross-instance roundtrip: ``commit`` from one ``evolutions/`` directory,
+  ``sync`` rehydrates a fresh empty ``evolutions/`` directory pointed at the
   same catalog.
 * conflict refusal + ``--force`` overwrite.
-* uncommitted migrations are not re-written.
+* uncommitted evolutions are not re-written.
 """
 
 from __future__ import annotations
@@ -19,20 +19,20 @@ import pytest
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NamespaceNotEmptyError, NoSuchNamespaceError
 
-from cambrian.config import CambrianConfig, CatalogConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, EvolutionsConfig
 from cambrian.migrate import apply_idempotent
 from cambrian.migrate.commit import (
     cambrian_commit,
     cambrian_uncommit,
 )
 from cambrian.migrate.sync import cambrian_sync
-from cambrian.sidecar.events import committed_migrations
+from cambrian.sidecar.events import committed_evolutions
 
 LAKEKEEPER_URL = "http://localhost:8181"
 WAREHOUSE = "cambrian"
 
 
-def _build_config(*, migrations_dir: Path, sidecar_namespace: str) -> CambrianConfig:
+def _build_config(*, evolutions_dir: Path, sidecar_namespace: str) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(
             type="rest",
@@ -46,8 +46,8 @@ def _build_config(*, migrations_dir: Path, sidecar_namespace: str) -> CambrianCo
                 "s3.path-style-access": "true",
             },
         ),
-        migrations=MigrationsConfig(
-            dir=str(migrations_dir),
+        evolutions=EvolutionsConfig(
+            dir=str(evolutions_dir),
             sidecar_namespace=sidecar_namespace,
         ),
     )
@@ -73,7 +73,7 @@ def sidecar_ns(rest_catalog: RestCatalog) -> Iterator[str]:
 def test_sync_cross_instance_roundtrip(
     rest_catalog: RestCatalog, ns: str, tmp_path: Path, sidecar_ns: str
 ) -> None:
-    """Apply + commit from migrations_a/, then sync into a fresh migrations_b/.
+    """Apply + commit from evolutions_a/, then sync into a fresh evolutions_b/.
 
     The two directories share a single catalog (the sidecar namespace) — that's
     the relationship between two clones of a repo pointing at the same prod
@@ -86,22 +86,22 @@ def test_sync_cross_instance_roundtrip(
         f"INSERT INTO {ns}.t VALUES (0);\n"
     )
 
-    migrations_a = tmp_path / "migrations_a"
-    _write(migrations_a / "current.sql", sql1)
-    cfg_a = _build_config(migrations_dir=migrations_a, sidecar_namespace=sidecar_ns)
+    evolutions_a = tmp_path / "evolutions_a"
+    _write(evolutions_a / "current.sql", sql1)
+    cfg_a = _build_config(evolutions_dir=evolutions_a, sidecar_namespace=sidecar_ns)
     apply_idempotent(cfg_a)
     cambrian_commit(cfg_a, message="seed")
 
-    # Second migration.
+    # Second evolution.
     sql2 = f"ALTER TABLE {ns}.t ADD COLUMN name STRING;\n"
-    _write(migrations_a / "current.sql", sql2)
+    _write(evolutions_a / "current.sql", sql2)
     apply_idempotent(cfg_a)
     cambrian_commit(cfg_a, message="add name")
 
     # Now run sync from a fresh empty directory.
-    migrations_b = tmp_path / "migrations_b"
-    migrations_b.mkdir()
-    cfg_b = _build_config(migrations_dir=migrations_b, sidecar_namespace=sidecar_ns)
+    evolutions_b = tmp_path / "evolutions_b"
+    evolutions_b.mkdir()
+    cfg_b = _build_config(evolutions_dir=evolutions_b, sidecar_namespace=sidecar_ns)
 
     result = cambrian_sync(cfg_b)
 
@@ -109,15 +109,15 @@ def test_sync_cross_instance_roundtrip(
     assert result.refused == 0
     assert not result.has_refusals
 
-    committed_b = migrations_b / "committed"
+    committed_b = evolutions_b / "committed"
     file_1 = committed_b / "0001_seed.sql"
     file_2 = committed_b / "0002_add-name.sql"
     assert file_1.exists()
     assert file_2.exists()
 
     # Content matches the originals exactly.
-    file_1_a = migrations_a / "committed" / "0001_seed.sql"
-    file_2_a = migrations_a / "committed" / "0002_add-name.sql"
+    file_1_a = evolutions_a / "committed" / "0001_seed.sql"
+    file_2_a = evolutions_a / "committed" / "0002_add-name.sql"
     assert file_1.read_text(encoding="utf-8") == file_1_a.read_text(encoding="utf-8")
     assert file_2.read_text(encoding="utf-8") == file_2_a.read_text(encoding="utf-8")
 
@@ -137,9 +137,9 @@ def test_sync_refuses_tampered_local_file(
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n"
         f"INSERT INTO {ns}.t VALUES (0);\n"
     )
-    migrations = tmp_path / "migrations"
-    _write(migrations / "current.sql", sql)
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    evolutions = tmp_path / "evolutions"
+    _write(evolutions / "current.sql", sql)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     apply_idempotent(cfg)
     commit_result = cambrian_commit(cfg, message="seed")
 
@@ -173,7 +173,7 @@ def test_sync_excludes_uncommitted(
 ) -> None:
     """A commit followed by an uncommit must not be re-written by sync.
 
-    The uncommit explicitly walked the migration back; sync rehydrating it
+    The uncommit explicitly walked the evolution back; sync rehydrating it
     would silently undo the user's intent on every fresh checkout.
     """
     del rest_catalog
@@ -181,9 +181,9 @@ def test_sync_excludes_uncommitted(
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n"
         f"INSERT INTO {ns}.t VALUES (0);\n"
     )
-    migrations = tmp_path / "migrations"
-    _write(migrations / "current.sql", sql)
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    evolutions = tmp_path / "evolutions"
+    _write(evolutions / "current.sql", sql)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     apply_idempotent(cfg)
     cambrian_commit(cfg, message="seed")
     cambrian_uncommit(cfg)
@@ -192,13 +192,13 @@ def test_sync_excludes_uncommitted(
     from cambrian.catalog import load_catalog
 
     catalog = load_catalog(cfg)
-    live = committed_migrations(catalog, sidecar_ns)
+    live = committed_evolutions(catalog, sidecar_ns)
     assert live == []
 
     # Sync from a fresh directory: writes nothing.
     fresh = tmp_path / "fresh"
     fresh.mkdir()
-    cfg_fresh = _build_config(migrations_dir=fresh, sidecar_namespace=sidecar_ns)
+    cfg_fresh = _build_config(evolutions_dir=fresh, sidecar_namespace=sidecar_ns)
     result = cambrian_sync(cfg_fresh)
 
     assert result.files == []

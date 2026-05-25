@@ -39,9 +39,9 @@ def test_events_schema_required_columns_present() -> None:
         "event_id",
         "event_ts",
         "event_type",
-        "migration_id",
-        "migration_hash",
-        "migration_sql",
+        "evolution_id",
+        "evolution_hash",
+        "evolution_sql",
         "actor",
         "notes",
     ]

@@ -8,6 +8,6 @@ warehouse             = "cambrian"
 "s3.region"           = "local"
 "s3.path-style-access"= "true"
 
-[migrations]
+[evolutions]
 dir               = "tests/fixtures/v1-smoke"
 sidecar_namespace = "_cambrian_v1_smoke"

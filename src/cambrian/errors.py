@@ -78,7 +78,7 @@ class DispatchError(CambrianError):
     """
 
 
-class MigrationNotFoundError(CambrianError):
+class EvolutionNotFoundError(CambrianError):
     """Raised when ``apply`` is asked to run against a missing ``current.sql``."""
 
 

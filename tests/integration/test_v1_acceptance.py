@@ -26,7 +26,7 @@ import pytest
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NamespaceNotEmptyError, NoSuchNamespaceError
 
-from cambrian.config import CambrianConfig, CatalogConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, EvolutionsConfig
 from cambrian.migrate import apply_idempotent
 from cambrian.migrate.commit import (
     cambrian_commit,
@@ -34,13 +34,13 @@ from cambrian.migrate.commit import (
     cambrian_uncommit,
 )
 from cambrian.migrate.sync import cambrian_sync
-from cambrian.sidecar.events import applied_committed_ids, committed_migrations
+from cambrian.sidecar.events import applied_committed_ids, committed_evolutions
 
 LAKEKEEPER_URL = "http://localhost:8181"
 WAREHOUSE = "cambrian"
 
 
-def _build_config(*, migrations_dir: Path, sidecar_namespace: str) -> CambrianConfig:
+def _build_config(*, evolutions_dir: Path, sidecar_namespace: str) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(
             type="rest",
@@ -54,8 +54,8 @@ def _build_config(*, migrations_dir: Path, sidecar_namespace: str) -> CambrianCo
                 "s3.path-style-access": "true",
             },
         ),
-        migrations=MigrationsConfig(
-            dir=str(migrations_dir),
+        evolutions=EvolutionsConfig(
+            dir=str(evolutions_dir),
             sidecar_namespace=sidecar_namespace,
         ),
     )
@@ -133,12 +133,12 @@ def test_v1_acceptance_full_lifecycle(
 ) -> None:
     """End-to-end V1 acceptance against a live Lakekeeper."""
     del rest_catalog  # ensures the docker stack is up
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
 
     # 1. apply idempotent (init is implicit via the runner's ensure_current).
     _write(current, _initial_schema(ns))
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     apply1 = apply_idempotent(cfg)
     assert apply1.status == "applied"
     assert apply1.error is None
@@ -169,7 +169,7 @@ def test_v1_acceptance_full_lifecycle(
 
     # 4. commit -m "initial schema"
     commit1 = cambrian_commit(cfg, message="initial schema")
-    assert commit1.migration_id == "0001_initial-schema"
+    assert commit1.evolution_id == "0001_initial-schema"
     assert commit1.tag_ref.startswith("cambrian.committed.1.")
     assert current.read_text(encoding="utf-8") == ""
 
@@ -180,28 +180,28 @@ def test_v1_acceptance_full_lifecycle(
     metadata_table = _verify_catalog().load_table((ns, "metadata"))
     assert {f.name for f in metadata_table.schema().fields} == {"key", "value"}
     commit2 = cambrian_commit(cfg, message="add metadata")
-    assert commit2.migration_id == "0002_add-metadata"
+    assert commit2.evolution_id == "0002_add-metadata"
 
-    # 6. uncommit. The second migration's SQL is restored to current.sql and
-    # the second migration's table changes are rolled back.
+    # 6. uncommit. The second evolution's SQL is restored to current.sql and
+    # the second evolution's table changes are rolled back.
     uncommit = cambrian_uncommit(cfg)
-    assert uncommit.migration_id == "0002_add-metadata"
+    assert uncommit.evolution_id == "0002_add-metadata"
     assert current.read_text(encoding="utf-8") == _add_metadata_table(ns)
     # The second committed file is gone; the first remains.
-    assert not (migrations / "committed" / "0002_add-metadata.sql").exists()
-    assert (migrations / "committed" / "0001_initial-schema.sql").exists()
+    assert not (evolutions / "committed" / "0002_add-metadata.sql").exists()
+    assert (evolutions / "committed" / "0001_initial-schema.sql").exists()
     applied_after_uncommit = applied_committed_ids(_verify_catalog(), sidecar_ns)
     assert "0001_initial-schema" in applied_after_uncommit
     assert "0002_add-metadata" not in applied_after_uncommit
 
     # 7. reset --to 0001_initial-schema. Audit trail preserved; rolls
-    # affected tables back to that migration's pinned post-state.
+    # affected tables back to that evolution's pinned post-state.
     # We need to re-apply current.sql first to get back to a state where
     # the metadata table exists, then prove reset --to rolls back what it
     # rolled back in its checkpoint.
     apply_idempotent(cfg)
-    reset_result = cambrian_reset_to(cfg, migration_id="0001_initial-schema")
-    assert reset_result.migration_id == "0001_initial-schema"
+    reset_result = cambrian_reset_to(cfg, evolution_id="0001_initial-schema")
+    assert reset_result.evolution_id == "0001_initial-schema"
     # 0001 didn't touch users/events/audit further than create; rollback
     # is no-op for whatever wasn't moved. The audit trail is what matters.
     assert reset_result.event_id is not None
@@ -211,13 +211,13 @@ def test_v1_acceptance_full_lifecycle(
     # same catalog: sync. Verifies committed/ rehydrates correctly.
     fresh = tmp_path / "fresh-clone"
     fresh.mkdir()
-    cfg_fresh = _build_config(migrations_dir=fresh, sidecar_namespace=sidecar_ns)
+    cfg_fresh = _build_config(evolutions_dir=fresh, sidecar_namespace=sidecar_ns)
     sync_result = cambrian_sync(cfg_fresh)
     assert sync_result.refused == 0
     assert sync_result.written == 1, sync_result.files
     assert (fresh / "committed" / "0001_initial-schema.sql").exists()
     # And the rehydrated file content matches the original byte-for-byte.
-    original_text = (migrations / "committed" / "0001_initial-schema.sql").read_text(
+    original_text = (evolutions / "committed" / "0001_initial-schema.sql").read_text(
         encoding="utf-8"
     )
     fresh_text = (fresh / "committed" / "0001_initial-schema.sql").read_text(encoding="utf-8")
@@ -229,8 +229,8 @@ def test_v1_acceptance_full_lifecycle(
     assert second_sync.skipped == 1
 
     # Final live state matches the catalog's truth.
-    live = committed_migrations(_verify_catalog(), sidecar_ns)
-    assert [m.migration_id for m in live] == ["0001_initial-schema"]
+    live = committed_evolutions(_verify_catalog(), sidecar_ns)
+    assert [m.evolution_id for m in live] == ["0001_initial-schema"]
 
 
 def test_v1_acceptance_apply_json_smoke(
@@ -245,9 +245,9 @@ def test_v1_acceptance_apply_json_smoke(
       * a second invocation is ``unchanged`` (idempotent contract)
     """
     del rest_catalog
-    migrations = tmp_path / "migrations"
+    evolutions = tmp_path / "evolutions"
     _write(
-        migrations / "current.sql",
+        evolutions / "current.sql",
         f"CREATE TABLE IF NOT EXISTS {ns}.smoke (id BIGINT) USING iceberg;\n",
     )
     toml_path = tmp_path / "cambrian.toml"
@@ -263,8 +263,8 @@ warehouse             = "{WAREHOUSE}"
 "s3.region"           = "local"
 "s3.path-style-access"= "true"
 
-[migrations]
-dir               = "{migrations}"
+[evolutions]
+dir               = "{evolutions}"
 sidecar_namespace = "{sidecar_ns}"
 """,
         encoding="utf-8",
@@ -288,11 +288,11 @@ sidecar_namespace = "{sidecar_ns}"
     first = subprocess.run(cmd_apply, check=False, capture_output=True, text=True, env=env)
     assert first.returncode == 0, first.stderr
     payload = json.loads(first.stdout)
-    for key in ("mode", "status", "migration_id", "migration_hash", "event_id", "statements"):
+    for key in ("mode", "status", "evolution_id", "evolution_hash", "event_id", "statements"):
         assert key in payload, f"missing key {key!r} in {payload}"
     assert payload["mode"] == "idempotent"
     assert payload["status"] == "applied"
-    assert payload["migration_id"] == "current"
+    assert payload["evolution_id"] == "current"
 
     second = subprocess.run(cmd_apply, check=False, capture_output=True, text=True, env=env)
     assert second.returncode == 0, second.stderr

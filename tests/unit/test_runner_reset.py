@@ -9,7 +9,7 @@ from __future__ import annotations
 from cambrian.iceberg.checkpoint import Checkpoint
 from cambrian.migrate.runner import (
     CHECKPOINT_TAG_PREFIX,
-    CURRENT_MIGRATION_ID,
+    CURRENT_EVOLUTION_ID,
     RESET_LAST_RESORT_HINT,
     _checkpoint_tag,
     _ident_str_to_tuple,
@@ -20,7 +20,7 @@ from cambrian.sidecar.events import TableStateRow
 
 def test_checkpoint_tag_uses_documented_prefix() -> None:
     assert _checkpoint_tag("current") == "cambrian.cp.current"
-    assert _checkpoint_tag(CURRENT_MIGRATION_ID) == f"{CHECKPOINT_TAG_PREFIX}current"
+    assert _checkpoint_tag(CURRENT_EVOLUTION_ID) == f"{CHECKPOINT_TAG_PREFIX}current"
 
 
 def test_row_to_checkpoint_full_pre_state() -> None:

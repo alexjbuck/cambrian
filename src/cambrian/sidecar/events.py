@@ -32,13 +32,13 @@ if TYPE_CHECKING:
     from pyiceberg.catalog import Catalog
 
 __all__ = [
-    "CommittedMigration",
+    "CommittedEvolution",
     "CommittedPayload",
     "Event",
     "EventType",
     "TableStateRow",
     "applied_committed_ids",
-    "committed_migrations",
+    "committed_evolutions",
     "committed_payloads",
     "latest_event",
     "table_states_for_event",
@@ -72,18 +72,18 @@ class Event:
     event_id: str
     event_ts: datetime
     event_type: str
-    migration_id: str
-    migration_hash: str
-    migration_sql: str
+    evolution_id: str
+    evolution_hash: str
+    evolution_sql: str
     actor: str
     notes: str | None
 
 
 @dataclass(frozen=True)
-class CommittedMigration:
+class CommittedEvolution:
     """Lightweight view of a ``commit`` event for status / sync."""
 
-    migration_id: str
+    evolution_id: str
     event_id: str
     event_ts: datetime
 
@@ -92,16 +92,16 @@ class CommittedMigration:
 class CommittedPayload:
     """A ``commit`` event with its full SQL payload, for ``cambrian sync``.
 
-    Distinct from :class:`CommittedMigration` because sync needs the
-    ``migration_sql`` and ``migration_hash`` columns; the lightweight view
+    Distinct from :class:`CommittedEvolution` because sync needs the
+    ``evolution_sql`` and ``evolution_hash`` columns; the lightweight view
     used by ``cambrian status`` doesn't.
     """
 
-    migration_id: str
+    evolution_id: str
     event_id: str
     event_ts: datetime
-    migration_sql: str
-    migration_hash: str
+    evolution_sql: str
+    evolution_hash: str
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +116,9 @@ _EVENTS_PA_SCHEMA = pa.schema(
         pa.field("event_id", pa.string(), nullable=False),
         pa.field("event_ts", pa.timestamp("us", tz="UTC"), nullable=False),
         pa.field("event_type", pa.string(), nullable=False),
-        pa.field("migration_id", pa.string(), nullable=False),
-        pa.field("migration_hash", pa.string(), nullable=False),
-        pa.field("migration_sql", pa.string(), nullable=False),
+        pa.field("evolution_id", pa.string(), nullable=False),
+        pa.field("evolution_hash", pa.string(), nullable=False),
+        pa.field("evolution_sql", pa.string(), nullable=False),
         pa.field("actor", pa.string(), nullable=False),
         pa.field("notes", pa.string(), nullable=True),
     ]
@@ -155,9 +155,9 @@ class _PendingEvent:
     event_id: str
     event_ts: datetime
     event_type: EventType
-    migration_id: str
-    migration_hash: str
-    migration_sql: str
+    evolution_id: str
+    evolution_hash: str
+    evolution_sql: str
     actor: str
     notes: str | None
     table_states: Sequence[TableStateRow] = field(default_factory=tuple)
@@ -168,9 +168,9 @@ def write_event(
     namespace: str,
     *,
     event_type: EventType,
-    migration_id: str,
-    migration_hash: str,
-    migration_sql: str,
+    evolution_id: str,
+    evolution_hash: str,
+    evolution_sql: str,
     actor: str,
     notes: str | None = None,
     table_states: Sequence[TableStateRow] = (),
@@ -187,9 +187,9 @@ def write_event(
         event_id=str(uuid.uuid4()),
         event_ts=event_ts or datetime.now(UTC),
         event_type=event_type,
-        migration_id=migration_id,
-        migration_hash=migration_hash,
-        migration_sql=migration_sql,
+        evolution_id=evolution_id,
+        evolution_hash=evolution_hash,
+        evolution_sql=evolution_sql,
         actor=actor,
         notes=notes,
         table_states=tuple(table_states),
@@ -209,9 +209,9 @@ def _event_to_arrow(event: _PendingEvent) -> pa.Table:
             "event_id": pa.array([event.event_id], type=pa.string()),
             "event_ts": pa.array([event.event_ts], type=pa.timestamp("us", tz="UTC")),
             "event_type": pa.array([event.event_type], type=pa.string()),
-            "migration_id": pa.array([event.migration_id], type=pa.string()),
-            "migration_hash": pa.array([event.migration_hash], type=pa.string()),
-            "migration_sql": pa.array([event.migration_sql], type=pa.string()),
+            "evolution_id": pa.array([event.evolution_id], type=pa.string()),
+            "evolution_hash": pa.array([event.evolution_hash], type=pa.string()),
+            "evolution_sql": pa.array([event.evolution_sql], type=pa.string()),
             "actor": pa.array([event.actor], type=pa.string()),
             "notes": pa.array([event.notes], type=pa.string()),
         },
@@ -256,13 +256,13 @@ def latest_event(
     namespace: str,
     *,
     event_type: EventType | None = None,
-    migration_id: str | None = None,
+    evolution_id: str | None = None,
 ) -> Event | None:
     """Return the most recent event matching the optional filters, or ``None``.
 
     Filters are applied in Python after a full scan — fine for the volumes
-    this log accumulates (one row per migration action). Status / sync code
-    needs the most-recent ``apply`` for ``migration_id="current"`` to know
+    this log accumulates (one row per evolution action). Status / sync code
+    needs the most-recent ``apply`` for ``evolution_id="current"`` to know
     what's "in flight" in dev mode.
     """
     arrow = _scan_events(catalog, namespace)
@@ -272,8 +272,8 @@ def latest_event(
     rows = arrow.to_pylist()
     if event_type is not None:
         rows = [r for r in rows if r["event_type"] == event_type]
-    if migration_id is not None:
-        rows = [r for r in rows if r["migration_id"] == migration_id]
+    if evolution_id is not None:
+        rows = [r for r in rows if r["evolution_id"] == evolution_id]
     if not rows:
         return None
 
@@ -282,18 +282,18 @@ def latest_event(
         event_id=latest["event_id"],
         event_ts=latest["event_ts"],
         event_type=latest["event_type"],
-        migration_id=latest["migration_id"],
-        migration_hash=latest["migration_hash"],
-        migration_sql=latest["migration_sql"],
+        evolution_id=latest["evolution_id"],
+        evolution_hash=latest["evolution_hash"],
+        evolution_sql=latest["evolution_sql"],
         actor=latest["actor"],
         notes=latest["notes"],
     )
 
 
-def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigration]:
-    """Return every committed migration currently live (commit not later uncommitted).
+def committed_evolutions(catalog: Catalog, namespace: str) -> list[CommittedEvolution]:
+    """Return every committed evolution currently live (commit not later uncommitted).
 
-    Ordered oldest-first by the *commit* event's timestamp. A migration that
+    Ordered oldest-first by the *commit* event's timestamp. An evolution that
     was committed then uncommitted is excluded; the audit trail retains both
     events but the working set is the commits without a later uncommit.
     """
@@ -305,15 +305,15 @@ def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigr
     for r in arrow.to_pylist():
         if r["event_type"] not in {"commit", "uncommit"}:
             continue
-        existing = latest_by_id.get(r["migration_id"])
+        existing = latest_by_id.get(r["evolution_id"])
         if existing is None or r["event_ts"] > existing["event_ts"]:
-            latest_by_id[r["migration_id"]] = r
+            latest_by_id[r["evolution_id"]] = r
 
     live = [r for r in latest_by_id.values() if r["event_type"] == "commit"]
     live.sort(key=lambda r: r["event_ts"])
     return [
-        CommittedMigration(
-            migration_id=r["migration_id"],
+        CommittedEvolution(
+            evolution_id=r["evolution_id"],
             event_id=r["event_id"],
             event_ts=r["event_ts"],
         )
@@ -324,10 +324,10 @@ def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigr
 def committed_payloads(catalog: Catalog, namespace: str) -> list[CommittedPayload]:
     """Return every live commit event with its full SQL + hash, oldest-first.
 
-    Like :func:`committed_migrations` but carries the ``migration_sql`` and
-    ``migration_hash`` columns — the payload ``cambrian sync`` writes back to
-    disk. Filters out any commit whose ``migration_id`` has a later
-    ``uncommit`` event (uncommitted migrations shouldn't be re-rehydrated).
+    Like :func:`committed_evolutions` but carries the ``evolution_sql`` and
+    ``evolution_hash`` columns — the payload ``cambrian sync`` writes back to
+    disk. Filters out any commit whose ``evolution_id`` has a later
+    ``uncommit`` event (uncommitted evolutions shouldn't be re-rehydrated).
     """
     arrow = _scan_events(catalog, namespace)
     if arrow.num_rows == 0:
@@ -337,31 +337,31 @@ def committed_payloads(catalog: Catalog, namespace: str) -> list[CommittedPayloa
     for r in arrow.to_pylist():
         if r["event_type"] not in {"commit", "uncommit"}:
             continue
-        existing = latest_by_id.get(r["migration_id"])
+        existing = latest_by_id.get(r["evolution_id"])
         if existing is None or r["event_ts"] > existing["event_ts"]:
-            latest_by_id[r["migration_id"]] = r
+            latest_by_id[r["evolution_id"]] = r
 
     live = [r for r in latest_by_id.values() if r["event_type"] == "commit"]
     live.sort(key=lambda r: r["event_ts"])
     return [
         CommittedPayload(
-            migration_id=r["migration_id"],
+            evolution_id=r["evolution_id"],
             event_id=r["event_id"],
             event_ts=r["event_ts"],
-            migration_sql=r["migration_sql"],
-            migration_hash=r["migration_hash"],
+            evolution_sql=r["evolution_sql"],
+            evolution_hash=r["evolution_hash"],
         )
         for r in live
     ]
 
 
 def applied_committed_ids(catalog: Catalog, namespace: str) -> dict[str, str]:
-    """Return ``{migration_id: migration_hash}`` for every committed migration applied.
+    """Return ``{evolution_id: evolution_hash}`` for every committed evolution applied.
 
-    A migration is "applied" if its latest ``apply`` or ``commit`` event is
+    An evolution is "applied" if its latest ``apply`` or ``commit`` event is
     newer than the latest ``uncommit`` event (or there is no uncommit). The
-    ``commit`` event is the immutable hash anchor written at the moment a
-    migration was promoted from ``current.sql``; ``apply`` events written
+    ``commit`` event is the immutable hash anchor written at the moment an
+    evolution was promoted from ``current.sql``; ``apply`` events written
     during later cross-checkout replay are also honored.
     """
     arrow = _scan_events(catalog, namespace)
@@ -371,23 +371,23 @@ def applied_committed_ids(catalog: Catalog, namespace: str) -> dict[str, str]:
     latest_anchor: dict[str, dict] = {}
     latest_uncommit_ts: dict[str, object] = {}
     for r in arrow.to_pylist():
-        if r["migration_id"] == "current":
+        if r["evolution_id"] == "current":
             continue
         if r["event_type"] in ("apply", "commit"):
-            existing = latest_anchor.get(r["migration_id"])
+            existing = latest_anchor.get(r["evolution_id"])
             if existing is None or r["event_ts"] > existing["event_ts"]:
-                latest_anchor[r["migration_id"]] = r
+                latest_anchor[r["evolution_id"]] = r
         elif r["event_type"] == "uncommit":
-            existing_ts = latest_uncommit_ts.get(r["migration_id"])
+            existing_ts = latest_uncommit_ts.get(r["evolution_id"])
             if existing_ts is None or r["event_ts"] > existing_ts:
-                latest_uncommit_ts[r["migration_id"]] = r["event_ts"]
+                latest_uncommit_ts[r["evolution_id"]] = r["event_ts"]
 
     out: dict[str, str] = {}
-    for migration_id, row in latest_anchor.items():
-        uncommit_ts = latest_uncommit_ts.get(migration_id)
+    for evolution_id, row in latest_anchor.items():
+        uncommit_ts = latest_uncommit_ts.get(evolution_id)
         if uncommit_ts is not None and uncommit_ts > row["event_ts"]:
             continue
-        out[migration_id] = row["migration_hash"]
+        out[evolution_id] = row["evolution_hash"]
     return out
 
 

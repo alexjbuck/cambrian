@@ -19,7 +19,7 @@ from anyio import Event
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NamespaceNotEmptyError, NoSuchNamespaceError
 
-from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, EvolutionsConfig
 from cambrian.migrate.watch import WatchEvent, watch
 
 LAKEKEEPER_URL = "http://localhost:8181"
@@ -27,7 +27,7 @@ WAREHOUSE = "cambrian"
 
 
 def _build_config(
-    *, migrations_dir: Path, sidecar_namespace: str, debounce_ms: int
+    *, evolutions_dir: Path, sidecar_namespace: str, debounce_ms: int
 ) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(
@@ -42,8 +42,8 @@ def _build_config(
                 "s3.path-style-access": "true",
             },
         ),
-        migrations=MigrationsConfig(
-            dir=str(migrations_dir),
+        evolutions=EvolutionsConfig(
+            dir=str(evolutions_dir),
             sidecar_namespace=sidecar_namespace,
         ),
         dev=DevConfig(debounce_ms=debounce_ms),
@@ -126,10 +126,10 @@ def test_watch_picks_up_edit(
 ) -> None:
     """Edit current.sql with the watcher running; the new table shows up in the catalog."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(current, f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n")
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns, debounce_ms=100)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns, debounce_ms=100)
 
     async def _edit_after_warmup() -> None:
         # Give the watcher a moment to settle after the initial apply.
@@ -173,10 +173,10 @@ def test_watch_debounce_coalesces_rapid_edits(
 ) -> None:
     """Two writes within debounce window → one apply, end state matches second."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(current, f"CREATE TABLE IF NOT EXISTS {ns}.t0 (id BIGINT) USING iceberg;\n")
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns, debounce_ms=500)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns, debounce_ms=500)
 
     async def _rapid_edits() -> None:
         await asyncio.sleep(0.5)
@@ -233,10 +233,10 @@ def test_watch_parse_error_does_not_crash(
 ) -> None:
     """A SQL parse failure surfaces as an event; the loop keeps watching."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(current, f"CREATE TABLE IF NOT EXISTS {ns}.ok (id BIGINT) USING iceberg;\n")
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns, debounce_ms=100)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns, debounce_ms=100)
 
     async def _break_then_fix() -> None:
         await asyncio.sleep(0.5)

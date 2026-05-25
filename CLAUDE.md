@@ -1,10 +1,19 @@
 # CLAUDE.md
 
-Project: **cambrian** — a Python 3.12+ CLI that manages SQL migrations for
-Apache Iceberg tables via PyIceberg's in-process API. Modeled on
+Project: **cambrian** — a Python 3.12+ CLI that manages SQL **evolutions**
+for Apache Iceberg tables via PyIceberg's in-process API. Modeled on
 graphile-migrate. `current.sql` + watch-mode hot reload for dev;
-`committed/` migrations applied non-interactively from CI for prod. Same
+`committed/` evolutions applied non-interactively from CI for prod. Same
 binary, both contexts.
+
+## Vocabulary — load-bearing
+
+Inside cambrian's code, docs, and JSON the canonical noun is
+**evolution** (matching Iceberg's "schema evolution" / "partition
+evolution"). The top-level `README.md` deliberately uses "migration"
+framing alongside "evolution" for SEO — people search "iceberg
+migration tool" and that traffic is load-bearing. Don't touch the
+top-level README in routine code changes.
 
 Implementation plan (source of truth):
 `/Users/alexjbuck/.claude/plans/the-tool-is-called-purrfect-brook.md`.
@@ -13,12 +22,12 @@ Implementation plan (source of truth):
 
 **Idempotent is the path; reset is the relief valve.**
 
-- **Idempotent (default)**: every migration must be re-applicable arbitrarily
+- **Idempotent (default)**: every evolution must be re-applicable arbitrarily
   many times with the same end state. `CREATE TABLE IF NOT EXISTS`, `ADD
   COLUMN IF NOT EXISTS`, etc. No rollback machinery; same code path locally
   and in CI.
 - **Reset (`--reset` or `[dev].mode = "reset"`)**: explicit opt-in for the
-  rare migration that genuinely cannot be expressed idempotently. Captures a
+  rare evolution that genuinely cannot be expressed idempotently. Captures a
   checkpoint, rolls back affected tables, re-runs.
 
 This hierarchy shows up in defaults, error messages, docs, examples. Reset
@@ -42,7 +51,7 @@ is **never** the recommended fix — only the last resort.
 - **Sidecar tables** in `_cambrian` namespace: `events`, `table_states`,
   `version`. All append-only. Self-migrated forward by Python functions in
   the binary; never edit a self-migration after release.
-- **Snapshot pinning**: Iceberg tag refs `cambrian.cp.<migration_id>` and
+- **Snapshot pinning**: Iceberg tag refs `cambrian.cp.<evolution_id>` and
   `cambrian.committed.<n>.<msg>` keep checkpoints alive against expiration.
 
 ## Stack and conventions
@@ -87,9 +96,9 @@ is **never** the recommended fix — only the last resort.
 ## Out of scope for v1 — don't build, don't design hooks for
 
 - `INSERT ... SELECT`, MERGE, DELETE
-- Declarative-diff mode (desired state → computed migrations)
+- Declarative-diff mode (desired state → computed evolutions)
 - Nessie / branch-based dev workflows
-- Cross-catalog migrations
+- Cross-catalog evolutions
 - Views, RBAC, table maintenance ops as first-class concepts
 - Static idempotency lint checks
 - Multi-developer `current.sql` collaboration

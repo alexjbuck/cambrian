@@ -56,7 +56,7 @@ warehouse = "{WAREHOUSE_NAME}"
 "s3.region" = "{RUSTFS_REGION}"
 "s3.path-style-access" = "true"
 
-[migrations]
+[evolutions]
 sidecar_namespace = "{sidecar_ns}"
 """
     path = tmp_path / "cambrian.toml"
@@ -83,7 +83,7 @@ def test_init_fresh_then_status(config_path: Path, sidecar_ns: str) -> None:
     assert payload["sidecar_version"] == 1
     assert payload["is_version_ahead"] is False
     assert payload["committed_count"] == 0
-    assert payload["committed_migrations"] == []
+    assert payload["committed_evolutions"] == []
     assert payload["current_applied"] is None
 
 
