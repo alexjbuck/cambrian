@@ -24,6 +24,11 @@ from cambrian.errors import (
     SidecarVersionAheadError,
 )
 from cambrian.migrate import apply_idempotent
+from cambrian.migrate.commit import (
+    cambrian_commit,
+    cambrian_reset_to,
+    cambrian_uncommit,
+)
 from cambrian.migrate.runner import (
     apply_reset,
     rollback_to_last_checkpoint,
@@ -473,6 +478,219 @@ def rollback_command(
         typer.echo(json.dumps(_reset_payload(result), indent=2, default=str))
     else:
         _print_reset_human(result)
+
+
+# ---------------------------------------------------------------------------
+# `cambrian commit` / `cambrian uncommit` / `cambrian reset --to`
+# ---------------------------------------------------------------------------
+
+
+@app.command("commit")
+def commit_command(
+    message: Annotated[
+        str,
+        typer.Option(
+            "--message",
+            "-m",
+            help="Short description of the committed migration (becomes the file slug).",
+        ),
+    ],
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Freeze ``current.sql`` as a committed migration.
+
+    Preconditions: ``current.sql`` is non-empty and applies cleanly (run
+    ``cambrian apply`` first). The current text is moved to
+    ``committed/<NNNN>_<slug>.sql``, the affected tables get a checkpoint
+    pinned at the ``cambrian.committed.<n>.<slug>`` tag, and ``current.sql``
+    is truncated for the next dev iteration.
+    """
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = cambrian_commit(cfg, message=message)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_commit_payload(result), default=str))
+        return
+
+    typer.echo(f"committed: {result.migration_id}")
+    typer.echo(f"file:      {result.committed_path}")
+    typer.echo(f"hash:      {result.migration_hash[:12]}…")
+    typer.echo(f"event:     {result.event_id or '<none>'}")
+    if result.affected_tables:
+        typer.echo(f"tables:    {', '.join(result.affected_tables)}")
+
+
+@app.command("uncommit")
+def uncommit_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Overwrite a non-empty current.sql with the uncommitted content. "
+                "Without --force, uncommit refuses to clobber unsaved work."
+            ),
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Pop the latest committed migration back into ``current.sql``.
+
+    Rolls the affected tables back to the checkpoint pinned at commit time
+    and deletes the committed file. Refuses if downstream committed files
+    exist (a gap in numbering would be a corruption) or if ``current.sql``
+    is non-empty without ``--force``.
+    """
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = cambrian_uncommit(cfg, force=force)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except ExternalWriteDetectedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_EXTERNAL_WRITE) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_uncommit_payload(result), default=str))
+        return
+
+    typer.echo(f"uncommitted: {result.migration_id}")
+    typer.echo(f"restored:    {result.restored_path}")
+    typer.echo(f"event:       {result.event_id or '<none>'}")
+    if result.rolled_back_tables:
+        typer.echo(f"rolled back: {', '.join(result.rolled_back_tables)}")
+    if result.skipped_tables:
+        typer.echo(f"skipped:     {', '.join(result.skipped_tables)}")
+
+
+@app.command(
+    "reset-to",
+    help=(
+        "Roll affected tables back to a committed migration's checkpoint. "
+        "INCIDENT RESPONSE ONLY — does not delete committed files, does not "
+        "touch downstream commit events. Reset is the relief valve, never "
+        "the recommended fix; reach for idempotent SQL first."
+    ),
+)
+def reset_to_command(
+    migration_id: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "The committed migration id to roll back to, e.g. '0007_add_users'. "
+                "See `cambrian status` for the live set."
+            ),
+        ),
+    ],
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Roll back to a specific committed migration's checkpoint (escape hatch).
+
+    Use ONLY for incident response. Idempotent SQL is the safety contract;
+    if you find yourself reaching for this, file an issue with the migration
+    that forced your hand so we can extend dispatch instead.
+    """
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = cambrian_reset_to(cfg, migration_id=migration_id)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except ExternalWriteDetectedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_EXTERNAL_WRITE) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_reset_to_payload(result), default=str))
+        return
+
+    typer.echo("mode:        reset --to (escape hatch — incident response only)")
+    typer.echo(f"migration:   {result.migration_id}")
+    typer.echo(f"event:       {result.event_id or '<none>'}")
+    if result.rolled_back_tables:
+        typer.echo(f"rolled back: {', '.join(result.rolled_back_tables)}")
+    if result.skipped_tables:
+        typer.echo(f"skipped:     {', '.join(result.skipped_tables)}")
+
+
+def _commit_payload(result: Any) -> dict[str, Any]:
+    return {
+        "migration_id": result.migration_id,
+        "committed_path": str(result.committed_path),
+        "migration_hash": result.migration_hash,
+        "event_id": result.event_id,
+        "affected_tables": result.affected_tables,
+    }
+
+
+def _uncommit_payload(result: Any) -> dict[str, Any]:
+    return {
+        "migration_id": result.migration_id,
+        "restored_path": str(result.restored_path),
+        "event_id": result.event_id,
+        "rolled_back_tables": result.rolled_back_tables,
+        "skipped_tables": result.skipped_tables,
+    }
+
+
+def _reset_to_payload(result: Any) -> dict[str, Any]:
+    return {
+        "mode": "reset --to",
+        "migration_id": result.migration_id,
+        "event_id": result.event_id,
+        "rolled_back_tables": result.rolled_back_tables,
+        "skipped_tables": result.skipped_tables,
+    }
 
 
 # ---------------------------------------------------------------------------
