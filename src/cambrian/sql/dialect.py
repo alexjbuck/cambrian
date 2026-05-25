@@ -44,15 +44,23 @@ __all__ = ["CambrianSpark"]
 def _column_arg(func: exp.Func) -> exp.Expr | None:
     """Return the first Column/Identifier argument of an Iceberg transform call.
 
-    Iceberg's transform calls (``bucket(N, col)``, ``truncate(N, col)``,
-    ``years(col)``, ``identity(col)``, ...) always reference exactly one
-    source column. This helper extracts it so callers don't need to know
-    the per-transform arity. Returns ``None`` if no column argument is
-    present (shouldn't happen for valid Iceberg DDL, but degrades gracefully).
+    Handles both argument shapes sqlglot uses:
+
+    * Anonymous funcs like ``bucket(N, col)`` carry args in ``expressions``.
+    * Typed funcs like ``year(col)`` end up as ``Year(this=Cast(Column))`` —
+      we walk through ``Cast`` wrappers to find the underlying column.
+
+    Returns ``None`` if no column argument is present (shouldn't happen for
+    valid Iceberg DDL, but degrades gracefully).
     """
     for arg in func.args.get("expressions") or []:
         if isinstance(arg, exp.Column | exp.Identifier):
             return arg
+    this = func.args.get("this")
+    while isinstance(this, exp.Cast):
+        this = this.args.get("this")
+    if isinstance(this, exp.Column | exp.Identifier):
+        return this
     return None
 
 

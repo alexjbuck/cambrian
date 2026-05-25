@@ -43,6 +43,45 @@ class CircularIncludeError(CambrianError):
         super().__init__(f"circular include detected: {chain}")
 
 
+class UnsupportedStatementError(CambrianError):
+    """Raised when dispatch encounters a SQL construct not in the v1 supported list.
+
+    Carries the source-line hint (extracted from the original expanded SQL) and a
+    one-line explanation so the CLI layer can format a precise pointer at the offending
+    statement. The v1 supported list lives in the plan §2.2 sidecar.
+    """
+
+    def __init__(
+        self,
+        *,
+        statement_sql: str,
+        reason: str,
+        line: int | None = None,
+    ) -> None:
+        self.statement_sql = statement_sql
+        self.reason = reason
+        self.line = line
+        location = f" at line {line}" if line is not None else ""
+        super().__init__(
+            f"unsupported SQL statement{location}: {reason}\n"
+            f"  statement: {statement_sql.strip()[:200]}"
+        )
+
+
+class DispatchError(CambrianError):
+    """Raised when dispatch translation fails for a reason other than "unsupported".
+
+    Examples: an INSERT VALUES whose literal can't be coerced to the table schema,
+    or an ALTER COLUMN whose target type isn't representable in Iceberg. Distinct
+    from :class:`UnsupportedStatementError` (the SQL is recognised — we just can't
+    run it).
+    """
+
+
+class MigrationNotFoundError(CambrianError):
+    """Raised when ``apply`` is asked to run against a missing ``current.sql``."""
+
+
 class ConfigNotFoundError(CambrianError):
     """Raised when the cambrian config file does not exist at the requested path."""
 
