@@ -1,0 +1,17 @@
+[project]
+name = "cambrian"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Alex Buck", email = "abuck@spear.ai" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cambrian = "cambrian:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
