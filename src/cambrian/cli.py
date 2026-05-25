@@ -22,6 +22,7 @@ from cambrian.errors import (
     NotInitializedError,
     SidecarVersionAheadError,
 )
+from cambrian.migrate import apply_idempotent
 from cambrian.sidecar.events import committed_migrations, latest_event
 from cambrian.sidecar.schema import CAMBRIAN_SIDECAR_VERSION
 from cambrian.sidecar.selfmigrate import ensure_current
@@ -289,3 +290,102 @@ def status_command(
             f"current applied: event {current.event_id} @ {current.event_ts.isoformat()} "
             f"(hash {current.migration_hash[:12]}…)"
         )
+
+
+# ---------------------------------------------------------------------------
+# `cambrian apply`
+# ---------------------------------------------------------------------------
+
+
+@app.command("apply")
+def apply_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    allow_partial: Annotated[
+        bool,
+        typer.Option(
+            "--allow-partial",
+            help=(
+                "Continue past statement failures and emit a partial-success event. "
+                "Without this flag, the first failure surfaces immediately."
+            ),
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON instead of the human view."),
+    ] = False,
+) -> None:
+    """Apply ``current.sql`` against the configured catalog.
+
+    Idempotent mode is the default — and at this milestone the *only* —
+    behaviour. Re-running with the same ``current.sql`` is a no-op (the
+    expanded-text hash is compared against the most recent ``apply``
+    event). Reset mode (rollback before re-apply) lands in M6 as the
+    explicit opt-in for non-idempotent migrations.
+    """
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = apply_idempotent(cfg, allow_partial=allow_partial)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_apply_payload(result), indent=2, default=str))
+    else:
+        _print_apply_human(result)
+
+    # Partial / errored apply: surface non-zero exit so CI fails loud.
+    if result.status == "partial" or result.error is not None:
+        raise typer.Exit(code=1)
+
+
+def _apply_payload(result: Any) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "migration_hash": result.migration_hash,
+        "event_id": result.event_id,
+        "sources": [str(p) for p in result.sources],
+        "statements": [
+            {
+                "sql": s.sql,
+                "notes": s.notes,
+                "affected_tables": [str(t) for t in s.affected_tables],
+                "error": s.error,
+            }
+            for s in result.statements
+        ],
+        "error": result.error,
+    }
+
+
+def _print_apply_human(result: Any) -> None:
+    if result.status == "unchanged":
+        typer.echo(f"current.sql unchanged (hash {result.migration_hash[:12]}…); nothing to apply")
+        return
+    typer.echo(f"status: {result.status}")
+    typer.echo(f"hash:   {result.migration_hash[:12]}…")
+    typer.echo(f"event:  {result.event_id or '<none>'}")
+    if result.statements:
+        typer.echo(f"statements: {len(result.statements)}")
+        for i, s in enumerate(result.statements, start=1):
+            head = (s.sql.strip().splitlines()[0] if s.sql.strip() else "<empty>")[:80]
+            marker = "ERR" if s.error else " OK"
+            typer.echo(f"  [{marker}] #{i}: {head}")
+            if s.notes:
+                typer.echo(f"        {s.notes}")
+            if s.error:
+                typer.echo(f"        ! {s.error}", err=True)
+    if result.error:
+        typer.echo(f"error: {result.error}", err=True)

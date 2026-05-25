@@ -34,14 +34,22 @@ class AddPartitionField(exp.Expression):
       ``this`` is the column reference; ``transform`` is ``None``.
     * ``ADD PARTITION FIELD bucket(16, x)`` — partition by a transform call.
       ``transform`` is the ``Func``/``Anonymous`` call; ``this`` is set to
-      the inner column for convenience.
+      the inner column when the transform's argument shape lets us extract
+      it (the common ``bucket(N, col)`` / ``truncate(N, col)`` case). For
+      typed-Func transforms where sqlglot puts the column under ``Func.this``
+      (e.g. ``Year(this=col)``), the dispatch layer pulls it from the
+      transform node.
 
     Optional ``alias`` carries an explicit partition-field name when the SQL
-    uses ``... AS <name>`` (Iceberg-Spark syntax for naming the field).
+    uses ``... AS <name>``.
     """
 
+    # ``this`` is optional because for typed transforms like ``year(col)``
+    # sqlglot's _parse_field returns a Func whose ``this`` is the column; we
+    # leave AddPartitionField.this unset and dispatch reads it from
+    # ``transform.this`` instead.
     arg_types: t.ClassVar[dict[str, bool]] = {
-        "this": True,
+        "this": False,
         "transform": False,
         "alias": False,
     }
@@ -58,7 +66,8 @@ class DropPartitionField(exp.Expression):
     verbatim and let dispatch translate to the right ``UpdateSpec`` call.
     """
 
-    arg_types: t.ClassVar[dict[str, bool]] = {"this": True, "transform": False}
+    # See AddPartitionField — ``this`` is optional for typed-Func transforms.
+    arg_types: t.ClassVar[dict[str, bool]] = {"this": False, "transform": False}
 
 
 class ReplacePartitionField(exp.Expression):
@@ -71,7 +80,7 @@ class ReplacePartitionField(exp.Expression):
 
     arg_types: t.ClassVar[dict[str, bool]] = {
         "this": True,
-        "transform": True,
+        "transform": False,
         "alias": False,
     }
 
