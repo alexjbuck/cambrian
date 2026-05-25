@@ -46,3 +46,41 @@ class SidecarVersionAheadError(CambrianError):
             f"sidecar is at version {found_version} but this cambrian only understands "
             f"up to version {expected_version}; upgrade cambrian to proceed"
         )
+
+
+class IllegalStateError(CambrianError):
+    """Raised when cambrian is asked to perform an operation whose preconditions are violated.
+
+    Distinct from a config or input-validation error: the *callers' wiring* is wrong and
+    no amount of retrying will fix it. Carries a hint pointing at the cambrian-level cause
+    (not the underlying PyIceberg surface), so the error trail is useful at the CLI layer.
+    """
+
+
+class ExternalWriteDetectedError(CambrianError):
+    """Raised when a rollback (or other guarded write) detects that another writer has
+    advanced the table's ``main`` ref since the checkpoint was captured.
+
+    The underlying PyIceberg signal is ``CommitFailedException`` from the
+    ``AssertRefSnapshotId`` requirement attached to the rollback ``_apply``. We wrap it
+    here so callers can distinguish the "someone else wrote" condition from generic
+    commit failures, and so the error message reads in cambrian's vocabulary (checkpoint,
+    rollback) rather than in PyIceberg's (requirement, base metadata).
+    """
+
+    def __init__(
+        self,
+        *,
+        ref: str,
+        expected_snapshot_id: int | None,
+        observed_snapshot_id: int | None,
+    ) -> None:
+        self.ref = ref
+        self.expected_snapshot_id = expected_snapshot_id
+        self.observed_snapshot_id = observed_snapshot_id
+        super().__init__(
+            f"external write detected on ref {ref!r}: expected snapshot "
+            f"{expected_snapshot_id}, found {observed_snapshot_id}. "
+            "Another writer advanced the table between checkpoint and rollback; "
+            "rollback aborted to avoid clobbering their commit."
+        )
