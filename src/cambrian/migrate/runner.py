@@ -1,4 +1,4 @@
-"""Apply orchestration for ``current.sql`` — idempotent mode (M5).
+"""Apply orchestration for ``current.sql`` — idempotent (M5) + reset (M6).
 
 The idempotent runner expands ``current.sql`` (with includes), hashes the
 expanded text, short-circuits if the hash matches the most recent ``apply``
@@ -6,10 +6,12 @@ event, and otherwise parses and dispatches each statement. One ``apply``
 event is emitted regardless of full/partial success, carrying the new hash,
 the full expanded SQL, and one ``table_states`` row per affected table.
 
-**Reset mode (rollback before re-apply) is M6 and explicitly absent here.**
-A failed statement under ``--allow-partial=False`` surfaces the error after
-the partial-success event is written; the runner does NOT roll back. That
-absence is the contract.
+Reset mode (``apply_reset``) is the opt-in path for non-idempotent
+migrations. It captures (or reuses) checkpoints for every affected table,
+detects out-of-band writes via the four-pointer atomic restore's
+``AssertRefSnapshotId`` requirement, rolls the tables back, re-executes the
+expanded SQL, and emits two events (``rollback`` then ``apply``) so the
+audit trail records both halves. Reset is never the default — see CLAUDE.md.
 """
 
 from __future__ import annotations
@@ -27,14 +29,21 @@ from pyiceberg.exceptions import NoSuchTableError
 from cambrian.catalog import load_catalog
 from cambrian.errors import (
     CambrianError,
+    ExternalWriteDetectedError,
     MigrationNotFoundError,
 )
 from cambrian.iceberg.affected import (
     TableIdent,
     affected_tables_with_overrides,
 )
-from cambrian.iceberg.checkpoint import capture
-from cambrian.sidecar.events import TableStateRow, latest_event, write_event
+from cambrian.iceberg.checkpoint import Checkpoint, capture, pin
+from cambrian.iceberg.txn import restore_pointers
+from cambrian.sidecar.events import (
+    TableStateRow,
+    latest_event,
+    table_states_for_event,
+    write_event,
+)
 from cambrian.sidecar.selfmigrate import ensure_current
 from cambrian.sql.dialect import CambrianSpark
 from cambrian.sql.dispatch import dispatch
@@ -46,7 +55,19 @@ if TYPE_CHECKING:
 
     from cambrian.config import CambrianConfig
 
-__all__ = ["ApplyResult", "StatementResult", "apply_idempotent"]
+__all__ = [
+    "ApplyResult",
+    "ResetResult",
+    "StatementResult",
+    "apply_idempotent",
+    "apply_reset",
+    "rollback_to_last_checkpoint",
+]
+
+# Migration id used for the dev-loop ``current.sql`` slot. Reset's checkpoint
+# tag is ``cambrian.cp.<migration_id>`` (per CLAUDE.md) → ``cambrian.cp.current``.
+CURRENT_MIGRATION_ID = "current"
+CHECKPOINT_TAG_PREFIX = "cambrian.cp."
 
 
 @dataclass
@@ -194,6 +215,18 @@ def apply_idempotent(
     )
 
 
+# Load-bearing per CLAUDE.md: idempotent is the path; reset is the relief
+# valve. Hints that mention ``--reset`` MUST frame it as a last resort, not
+# the recommended fix. Use this constant so the framing stays consistent.
+RESET_LAST_RESORT_HINT = (
+    "If — and only if — this statement genuinely cannot be expressed "
+    "idempotently, ``cambrian apply --reset`` will roll the affected tables "
+    "back before re-applying. Prefer to make the SQL idempotent first "
+    "(e.g. add ``IF EXISTS`` / ``IF NOT EXISTS``); reset is the relief "
+    "valve, not the recommended path."
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -309,3 +342,472 @@ def _load_or_none(catalog: Catalog, ident: TableIdent) -> Table | None:
         return catalog.load_table(tup)
     except NoSuchTableError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Reset mode (M6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableRollback:
+    """Summary of one table's rollback within a reset cycle."""
+
+    ident: str
+    rolled_back: bool
+    from_snapshot_id: int | None = None
+    to_snapshot_id: int | None = None
+    reason: str = ""
+
+
+@dataclass
+class ResetResult:
+    """Outcome of an ``apply_reset`` cycle.
+
+    Captures both the rollback half (per affected table) and the subsequent
+    apply half (a regular :class:`ApplyResult`) so callers can see what
+    moved without parsing two events out of the log.
+    """
+
+    status: str
+    migration_hash: str
+    sources: list[Path] = field(default_factory=list)
+    rollbacks: list[TableRollback] = field(default_factory=list)
+    apply_result: ApplyResult | None = None
+    rollback_event_id: str | None = None
+    apply_event_id: str | None = None
+    error: str | None = None
+
+
+def _checkpoint_tag(migration_id: str) -> str:
+    return f"{CHECKPOINT_TAG_PREFIX}{migration_id}"
+
+
+def _row_to_checkpoint(row: TableStateRow) -> Checkpoint | None:
+    """Reconstruct a :class:`Checkpoint` from a stored ``table_states`` row.
+
+    Returns ``None`` if the row's pre-state is empty (the table didn't
+    exist before that apply) — there's nothing to roll back to.
+    """
+    if (
+        row.pre_schema_id is None
+        or row.pre_spec_id is None
+        or row.pre_sort_order_id is None
+        or row.pre_metadata_loc is None
+    ):
+        return None
+    return Checkpoint(
+        snapshot_id=row.pre_snapshot_id,
+        schema_id=row.pre_schema_id,
+        spec_id=row.pre_spec_id,
+        sort_order_id=row.pre_sort_order_id,
+        metadata_loc=row.pre_metadata_loc,
+        tag_ref=row.tag_ref,
+    )
+
+
+def _load_prior_checkpoints(
+    catalog: Catalog,
+    namespace: str,
+    *,
+    migration_id: str,
+) -> dict[str, Checkpoint]:
+    """Read every per-table checkpoint stashed by the most recent ``rollback`` event.
+
+    Reset writes a rollback event each cycle whose ``pre_*`` fields encode
+    the captured-fresh state of each affected table at the start of that
+    reset cycle — *the state we want to roll back to* on the next reset.
+    The latest ``apply`` event's pre-fields would carry idempotent-mode
+    state which doesn't include the checkpoint capture.
+
+    Returns an empty dict if no prior rollback event exists.
+    """
+    prior = latest_event(catalog, namespace, event_type="rollback", migration_id=migration_id)
+    if prior is None:
+        return {}
+    rows = table_states_for_event(catalog, namespace, event_id=prior.event_id)
+    out: dict[str, Checkpoint] = {}
+    for row in rows:
+        cp = _row_to_checkpoint(row)
+        if cp is not None:
+            out[row.table_ident] = cp
+    return out
+
+
+def _load_post_snapshots(
+    catalog: Catalog,
+    namespace: str,
+    *,
+    migration_id: str,
+) -> dict[str, int | None]:
+    """Return {ident_str: post_snapshot_id} from the most recent ``apply`` for *migration_id*.
+
+    Used by external-write detection: compare each table's current main
+    snapshot against the *post* state recorded by the prior apply. A
+    divergence means someone else wrote between then and now.
+    """
+    prior = latest_event(catalog, namespace, event_type="apply", migration_id=migration_id)
+    if prior is None:
+        return {}
+    rows = table_states_for_event(catalog, namespace, event_id=prior.event_id)
+    return {row.table_ident: row.post_snapshot_id for row in rows}
+
+
+def apply_reset(
+    config: CambrianConfig,
+    *,
+    allow_partial: bool = False,
+    force: bool = False,
+    actor: str | None = None,
+) -> ResetResult:
+    """Apply ``current.sql`` in reset mode.
+
+    Reset is the relief valve for non-idempotent SQL — never the default
+    path. The flow:
+
+    1. Expand + hash ``current.sql``; short-circuit if the hash matches the
+       last reset's apply event AND no external writes are detected.
+    2. Discover affected tables.
+    3. Load prior checkpoints from the last ``apply`` event for ``current``
+       (if any). For tables with no prior checkpoint, capture and pin one
+       now so a *future* reset can roll back to this state.
+    4. External-write detection: each table's current ``main`` snapshot id
+       must match the prior apply's ``post_snapshot_id``. Divergence is an
+       :class:`ExternalWriteDetectedError` unless ``force=True``.
+    5. Roll back each table to its checkpoint via the M4 four-pointer
+       restore. Tables without a prior checkpoint are skipped (nothing to
+       roll back to).
+    6. Emit a ``rollback`` event capturing what moved.
+    7. Re-execute the SQL via :func:`apply_idempotent`. Emit its ``apply``
+       event with the new post-state.
+
+    Raises:
+        ExternalWriteDetectedError: a table moved out-of-band and ``force``
+            is false.
+        CambrianError: any of the underlying parse/dispatch/commit errors.
+    """
+    current_sql_path = _resolve_current_sql(config)
+    expanded = expand(current_sql_path)
+    catalog = load_catalog(config)
+    state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
+    namespace = state.sidecar_namespace
+
+    statements_raw = sqlglot.parse(expanded.text, dialect=CambrianSpark)
+    statements = [s for s in statements_raw if s is not None]
+    per_stmt_tables = affected_tables_with_overrides(expanded.text, statements)
+    idents = _unique_tables(per_stmt_tables)
+
+    prior_checkpoints = _load_prior_checkpoints(
+        catalog, namespace, migration_id=CURRENT_MIGRATION_ID
+    )
+    prior_post_snapshots = _load_post_snapshots(
+        catalog, namespace, migration_id=CURRENT_MIGRATION_ID
+    )
+
+    if not force:
+        diverged = _check_external_writes(catalog, idents, prior_post_snapshots)
+        if diverged:
+            details = ", ".join(diverged)
+            raise ExternalWriteDetectedError(
+                ref=f"main (tables: {details})",
+                expected_snapshot_id=None,
+                observed_snapshot_id=None,
+            )
+
+    rollbacks: list[TableRollback] = []
+
+    # Phase 1: snapshot the pre-reset state of every affected table. This
+    # is what the *next* reset will roll back to — captured before phase 2
+    # so it survives the upcoming rollback.
+    pre_reset_states: dict[str, Checkpoint] = {}
+    tag_name = _checkpoint_tag(CURRENT_MIGRATION_ID)
+    for ident in idents:
+        table = _load_or_none(catalog, ident)
+        if table is None:
+            continue
+        cp_pre = capture(table)
+        pre_reset_states[str(ident)] = cp_pre
+        try:
+            pin(table, tag_name=tag_name, snapshot_id=cp_pre.snapshot_id)
+        except Exception:
+            pass
+
+    # Phase 2: roll back to the prior reset's checkpoint, if any.
+    for ident in idents:
+        ident_str = str(ident)
+        table = _load_or_none(catalog, ident)
+        if table is None:
+            rollbacks.append(
+                TableRollback(
+                    ident=ident_str,
+                    rolled_back=False,
+                    reason="table does not exist yet",
+                )
+            )
+            continue
+
+        cp = prior_checkpoints.get(ident_str)
+        pre_snap = table.current_snapshot()
+        pre_snap_id = pre_snap.snapshot_id if pre_snap is not None else None
+
+        if cp is None:
+            rollbacks.append(
+                TableRollback(
+                    ident=ident_str,
+                    rolled_back=False,
+                    from_snapshot_id=pre_snap_id,
+                    to_snapshot_id=pre_snap_id,
+                    reason="no prior checkpoint; captured one for next reset",
+                )
+            )
+            continue
+
+        restore_pointers(
+            table,
+            target_snapshot_id=cp.snapshot_id,
+            target_schema_id=cp.schema_id,
+            target_spec_id=cp.spec_id,
+            target_sort_order_id=cp.sort_order_id,
+            expected_current_snapshot_id=pre_snap_id,
+        )
+        rolled_back_table = catalog.load_table(_ident_to_tuple(ident))
+        post_snap = rolled_back_table.current_snapshot()
+        post_snap_id = post_snap.snapshot_id if post_snap is not None else None
+        rollbacks.append(
+            TableRollback(
+                ident=ident_str,
+                rolled_back=True,
+                from_snapshot_id=pre_snap_id,
+                to_snapshot_id=post_snap_id,
+                reason="rolled back to prior checkpoint",
+            )
+        )
+
+    # Phase 3: re-execute the SQL against the rolled-back tables.
+    try:
+        apply_result = apply_idempotent(config, allow_partial=allow_partial, actor=actor)
+    except CambrianError as err:
+        return ResetResult(
+            status="partial",
+            migration_hash=expanded.hash,
+            sources=expanded.sources,
+            rollbacks=rollbacks,
+            error=str(err),
+        )
+
+    # Phase 4: record the pre-reset states captured in phase 1 as the
+    # next reset's rollback target. Tables that didn't exist at reset start
+    # (i.e. were created by the apply) do NOT get a row — we can't
+    # restore to "doesn't exist" with the 4-pointer primitive. The next
+    # reset will treat those as fresh (and capture a checkpoint then).
+    rollback_states: list[TableStateRow] = []
+    for ident in idents:
+        ident_str = str(ident)
+        cp = pre_reset_states.get(ident_str)
+        if cp is None:
+            continue
+        rollback_states.append(
+            TableStateRow(
+                table_ident=ident_str,
+                pre_snapshot_id=cp.snapshot_id,
+                pre_schema_id=cp.schema_id,
+                pre_spec_id=cp.spec_id,
+                pre_sort_order_id=cp.sort_order_id,
+                pre_metadata_loc=cp.metadata_loc,
+                post_snapshot_id=cp.snapshot_id,
+                post_schema_id=cp.schema_id,
+                post_spec_id=cp.spec_id,
+                post_sort_order_id=cp.sort_order_id,
+                tag_ref=tag_name if cp.snapshot_id is not None else None,
+            )
+        )
+
+    rollback_event_id = write_event(
+        catalog,
+        namespace,
+        event_type="rollback",
+        migration_id=CURRENT_MIGRATION_ID,
+        migration_hash=expanded.hash,
+        migration_sql=expanded.text,
+        actor=actor or _default_actor(),
+        notes=(
+            f"rolled back {sum(1 for r in rollbacks if r.rolled_back)} "
+            f"of {len(rollbacks)} tables; captured {len(rollback_states)} "
+            "pre-reset checkpoints for next reset"
+        ),
+        table_states=rollback_states,
+    )
+
+    return ResetResult(
+        status=apply_result.status,
+        migration_hash=expanded.hash,
+        sources=expanded.sources,
+        rollbacks=rollbacks,
+        apply_result=apply_result,
+        rollback_event_id=rollback_event_id,
+        apply_event_id=apply_result.event_id,
+        error=apply_result.error,
+    )
+
+
+def rollback_to_last_checkpoint(
+    config: CambrianConfig,
+    *,
+    actor: str | None = None,
+) -> ResetResult:
+    """Roll the affected tables of the last ``apply`` for ``current`` back to their checkpoints.
+
+    Does not re-execute ``current.sql`` afterwards. Used by ``cambrian
+    rollback``: useful for "I want to undo the dev work I just did and
+    re-edit ``current.sql`` from scratch". Emits a ``rollback`` event only.
+
+    The set of "affected tables" is determined by the last apply event's
+    ``table_states`` rows, not by re-parsing ``current.sql``. This matches
+    user intent: you're rolling back the *state that was last applied*,
+    even if ``current.sql`` has since changed in ways that would now
+    touch different tables.
+    """
+    catalog = load_catalog(config)
+    state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
+    namespace = state.sidecar_namespace
+
+    prior = latest_event(catalog, namespace, event_type="apply", migration_id=CURRENT_MIGRATION_ID)
+    if prior is None:
+        # Nothing has been applied; nothing to roll back. Surface a
+        # ResetResult with status=unchanged so callers can render a
+        # sensible message.
+        return ResetResult(
+            status="unchanged",
+            migration_hash="",
+            sources=[],
+            rollbacks=[],
+        )
+
+    rows = table_states_for_event(catalog, namespace, event_id=prior.event_id)
+    rollbacks: list[TableRollback] = []
+    rollback_states: list[TableStateRow] = []
+
+    for row in rows:
+        cp = _row_to_checkpoint(row)
+        if cp is None:
+            rollbacks.append(
+                TableRollback(
+                    ident=row.table_ident,
+                    rolled_back=False,
+                    reason="no prior checkpoint",
+                )
+            )
+            continue
+        # Parse "ns.t" back into a tuple for catalog.load_table.
+        ident_tuple = _ident_str_to_tuple(row.table_ident)
+        try:
+            table = catalog.load_table(ident_tuple)
+        except NoSuchTableError:
+            rollbacks.append(
+                TableRollback(
+                    ident=row.table_ident,
+                    rolled_back=False,
+                    reason="table no longer exists",
+                )
+            )
+            continue
+
+        current = table.current_snapshot()
+        from_snap = current.snapshot_id if current is not None else None
+        restore_pointers(
+            table,
+            target_snapshot_id=cp.snapshot_id,
+            target_schema_id=cp.schema_id,
+            target_spec_id=cp.spec_id,
+            target_sort_order_id=cp.sort_order_id,
+            expected_current_snapshot_id=from_snap,
+        )
+        rolled = catalog.load_table(ident_tuple)
+        post = rolled.current_snapshot()
+        rollbacks.append(
+            TableRollback(
+                ident=row.table_ident,
+                rolled_back=True,
+                from_snapshot_id=from_snap,
+                to_snapshot_id=post.snapshot_id if post is not None else None,
+                reason="rolled back to prior checkpoint",
+            )
+        )
+        rollback_states.append(
+            TableStateRow(
+                table_ident=row.table_ident,
+                pre_snapshot_id=from_snap,
+                pre_schema_id=rolled.schema().schema_id,
+                pre_spec_id=rolled.spec().spec_id,
+                pre_sort_order_id=rolled.sort_order().order_id,
+                pre_metadata_loc=rolled.metadata_location,
+                post_snapshot_id=cp.snapshot_id,
+                post_schema_id=cp.schema_id,
+                post_spec_id=cp.spec_id,
+                post_sort_order_id=cp.sort_order_id,
+                tag_ref=cp.tag_ref,
+            )
+        )
+
+    event_id = write_event(
+        catalog,
+        namespace,
+        event_type="rollback",
+        migration_id=CURRENT_MIGRATION_ID,
+        migration_hash=prior.migration_hash,
+        migration_sql=prior.migration_sql,
+        actor=actor or _default_actor(),
+        notes=f"manual rollback of {sum(1 for r in rollbacks if r.rolled_back)} tables",
+        table_states=rollback_states,
+    )
+
+    return ResetResult(
+        status="applied",
+        migration_hash=prior.migration_hash,
+        sources=[],
+        rollbacks=rollbacks,
+        rollback_event_id=event_id,
+    )
+
+
+def _check_external_writes(
+    catalog: Catalog,
+    idents: list[TableIdent],
+    prior_post_snapshots: dict[str, int | None],
+) -> list[str]:
+    """Return the list of table idents whose current snapshot diverges from prior.
+
+    A table that exists in *prior_post_snapshots* but whose ``main`` snapshot
+    has moved since the last apply is reported. New tables (no entry in
+    prior) are skipped: there's no prior state to diverge from.
+    """
+    diverged: list[str] = []
+    for ident in idents:
+        ident_str = str(ident)
+        if ident_str not in prior_post_snapshots:
+            continue
+        expected = prior_post_snapshots[ident_str]
+        table = _load_or_none(catalog, ident)
+        if table is None:
+            # The prior apply touched this table, but it's gone now —
+            # that's a strong "external write" signal (someone DROPped it).
+            diverged.append(ident_str)
+            continue
+        snap = table.current_snapshot()
+        observed = snap.snapshot_id if snap is not None else None
+        if observed != expected:
+            diverged.append(ident_str)
+    return diverged
+
+
+def _ident_to_tuple(ident: TableIdent) -> tuple[str, ...]:
+    if ident.namespace:
+        return (*ident.namespace.split("."), ident.name)
+    return (ident.name,)
+
+
+def _ident_str_to_tuple(ident: str) -> tuple[str, ...]:
+    if "." in ident:
+        ns, name = ident.rsplit(".", 1)
+        return (*ns.split("."), name)
+    return (ident,)

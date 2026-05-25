@@ -174,33 +174,46 @@ def test_watch_initial_apply_can_be_skipped(
     assert calls == []
 
 
-def test_watch_use_reset_without_pr_b_raises(
+def test_watch_use_reset_routes_to_apply_reset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Asking for reset mode in PR-a's build is a clean CambrianError."""
-    cfg = _make_config(tmp_path)
-    monkeypatch.setattr(watch_mod, "apply_idempotent", _stub_apply_factory([]))
-    # Ensure no apply_reset is exposed on runner (PR-a state).
+    """``use_reset=True`` routes through ``apply_reset``, not ``apply_idempotent``."""
     from cambrian.migrate import runner
+    from cambrian.migrate.runner import ResetResult
 
-    monkeypatch.delattr(runner, "apply_reset", raising=False)
+    cfg = _make_config(tmp_path)
+    # Track which entry point fires.
+    routed_to: list[str] = []
 
-    fake = _FakeWatcher([])
+    def _idem(
+        config: CambrianConfig, *, allow_partial: bool = False, actor: str | None = None
+    ) -> ApplyResult:
+        del config, allow_partial, actor
+        routed_to.append("idempotent")
+        return ApplyResult(status="applied", migration_hash="i" * 64)
 
-    events: list[watch_mod.WatchEvent] = []
+    def _reset(
+        config: CambrianConfig,
+        *,
+        allow_partial: bool = False,
+        force: bool = False,
+        actor: str | None = None,
+    ) -> ResetResult:
+        del config, allow_partial, force, actor
+        routed_to.append("reset")
+        return ResetResult(status="applied", migration_hash="r" * 64)
+
+    monkeypatch.setattr(watch_mod, "apply_idempotent", _idem)
+    monkeypatch.setattr(runner, "apply_reset", _reset)
+
+    fake = _FakeWatcher([{(Change.modified, "x.sql")}])
 
     async def _run() -> None:
-        await watch_mod.watch(
-            cfg,
-            watcher_factory=fake,
-            use_reset=True,
-            on_event=events.append,
-        )
+        await watch_mod.watch(cfg, watcher_factory=fake, use_reset=True)
 
     asyncio.run(_run())
-    # Initial apply hits the gate and is reported as error; loop runs to
-    # exhaustion of the (empty) fake watcher.
-    assert any(e.kind == "error" for e in events)
+    # Both the initial apply and the post-edit apply must have gone through reset.
+    assert routed_to == ["reset", "reset"]
 
 
 def test_watch_resolves_targets_from_includes(tmp_path: Path) -> None:

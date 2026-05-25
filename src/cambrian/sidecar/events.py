@@ -38,6 +38,7 @@ __all__ = [
     "TableStateRow",
     "committed_migrations",
     "latest_event",
+    "table_states_for_event",
     "write_event",
 ]
 
@@ -283,6 +284,40 @@ def committed_migrations(catalog: Catalog, namespace: str) -> list[CommittedMigr
             migration_id=r["migration_id"],
             event_id=r["event_id"],
             event_ts=r["event_ts"],
+        )
+        for r in rows
+    ]
+
+
+def table_states_for_event(
+    catalog: Catalog,
+    namespace: str,
+    *,
+    event_id: str,
+) -> list[TableStateRow]:
+    """Return the per-table state rows attached to *event_id*, in arbitrary order.
+
+    Cambrian's reset path uses this to read the *pre-state* of an earlier
+    ``apply`` event so it can roll the affected tables back to that snapshot
+    before re-applying.
+    """
+    arrow = catalog.load_table((namespace, TABLE_STATES_TABLE)).scan().to_arrow()
+    if arrow.num_rows == 0:
+        return []
+    rows = [r for r in arrow.to_pylist() if r["event_id"] == event_id]
+    return [
+        TableStateRow(
+            table_ident=r["table_ident"],
+            pre_snapshot_id=r["pre_snapshot_id"],
+            pre_schema_id=r["pre_schema_id"],
+            pre_spec_id=r["pre_spec_id"],
+            pre_sort_order_id=r["pre_sort_order_id"],
+            pre_metadata_loc=r["pre_metadata_loc"],
+            post_snapshot_id=r["post_snapshot_id"],
+            post_schema_id=r["post_schema_id"],
+            post_spec_id=r["post_spec_id"],
+            post_sort_order_id=r["post_sort_order_id"],
+            tag_ref=r["tag_ref"],
         )
         for r in rows
     ]

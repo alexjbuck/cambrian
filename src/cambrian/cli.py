@@ -19,10 +19,15 @@ from cambrian.catalog import load_catalog
 from cambrian.config import load_config, redacted_dump
 from cambrian.errors import (
     CambrianError,
+    ExternalWriteDetectedError,
     NotInitializedError,
     SidecarVersionAheadError,
 )
 from cambrian.migrate import apply_idempotent
+from cambrian.migrate.runner import (
+    apply_reset,
+    rollback_to_last_checkpoint,
+)
 from cambrian.migrate.watch import watch as _watch_loop
 from cambrian.sidecar.events import committed_migrations, latest_event
 from cambrian.sidecar.schema import CAMBRIAN_SIDECAR_VERSION
@@ -32,6 +37,7 @@ from cambrian.sidecar.selfmigrate import ensure_current
 # "not initialized" from generic errors.
 EXIT_NOT_INITIALIZED = 2
 EXIT_VERSION_AHEAD = 3
+EXIT_EXTERNAL_WRITE = 4
 
 app = typer.Typer(
     name="cambrian",
@@ -311,6 +317,29 @@ def apply_command(
             ),
         ),
     ] = False,
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help=(
+                "Run in reset mode: roll the affected tables back to their last "
+                "checkpoint, then re-apply. Use ONLY for migrations that genuinely "
+                "cannot be expressed idempotently — idempotent is the default and "
+                "the safety contract."
+            ),
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Override external-write detection when using --reset. Required only "
+                "if another writer has advanced one of the affected tables since the "
+                "last cambrian apply; using this risks clobbering their work."
+            ),
+        ),
+    ] = False,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Emit machine-readable JSON instead of the human view."),
@@ -318,11 +347,11 @@ def apply_command(
 ) -> None:
     """Apply ``current.sql`` against the configured catalog.
 
-    Idempotent mode is the default — and at this milestone the *only* —
-    behaviour. Re-running with the same ``current.sql`` is a no-op (the
-    expanded-text hash is compared against the most recent ``apply``
-    event). Reset mode (rollback before re-apply) lands in M6 as the
-    explicit opt-in for non-idempotent migrations.
+    Idempotent mode is the default. Reset mode (``--reset`` or
+    ``[dev].mode = "reset"``) is the opt-in escape hatch for migrations
+    that genuinely cannot be expressed idempotently: it rolls the affected
+    tables back to their last checkpoint, then re-applies. Idempotent is
+    the path; reset is the relief valve.
     """
     try:
         cfg = load_config(path)
@@ -330,7 +359,18 @@ def apply_command(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    use_reset = reset or cfg.dev.mode == "reset"
+
     try:
+        if use_reset:
+            reset_result = apply_reset(cfg, allow_partial=allow_partial, force=force)
+            if as_json:
+                typer.echo(json.dumps(_reset_payload(reset_result), indent=2, default=str))
+            else:
+                _print_reset_human(reset_result)
+            if reset_result.status == "partial" or reset_result.error is not None:
+                raise typer.Exit(code=1)
+            return
         result = apply_idempotent(cfg, allow_partial=allow_partial)
     except NotInitializedError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -338,6 +378,14 @@ def apply_command(
     except SidecarVersionAheadError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except ExternalWriteDetectedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo(
+            "  hint: re-run with --force ONLY if you intentionally want to overwrite "
+            "the out-of-band writer's commit.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_EXTERNAL_WRITE) from exc
     except CambrianError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -350,6 +398,81 @@ def apply_command(
     # Partial / errored apply: surface non-zero exit so CI fails loud.
     if result.status == "partial" or result.error is not None:
         raise typer.Exit(code=1)
+
+
+@app.command("redo")
+def redo_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    allow_partial: Annotated[
+        bool,
+        typer.Option("--allow-partial", help="Continue past statement failures."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Override external-write detection. See `cambrian apply --reset --help`.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Alias for ``cambrian apply --reset``.
+
+    Same semantics, shorter to type during a non-idempotent-migration
+    dev loop. Reset is the relief valve — prefer idempotent SQL.
+    """
+    apply_command(
+        path=path,
+        allow_partial=allow_partial,
+        reset=True,
+        force=force,
+        as_json=as_json,
+    )
+
+
+@app.command("rollback")
+def rollback_command(
+    path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON output."),
+    ] = False,
+) -> None:
+    """Roll the affected tables of the last apply back to their checkpoint, without re-applying.
+
+    Useful when you want to discard a dev iteration's table mutations
+    entirely and edit ``current.sql`` from scratch. Does not re-execute
+    SQL afterwards — the next ``cambrian apply`` re-applies the (possibly
+    edited) ``current.sql``.
+    """
+    try:
+        cfg = load_config(path)
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = rollback_to_last_checkpoint(cfg)
+    except NotInitializedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
+    except SidecarVersionAheadError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_VERSION_AHEAD) from exc
+    except ExternalWriteDetectedError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=EXIT_EXTERNAL_WRITE) from exc
+    except CambrianError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(_reset_payload(result), indent=2, default=str))
+    else:
+        _print_reset_human(result)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +500,24 @@ def watch_command(
             help="Continue past statement failures and emit a partial-success event.",
         ),
     ] = False,
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help=(
+                "Run each re-apply in reset mode. Use ONLY for migrations that "
+                "genuinely cannot be expressed idempotently. Honours "
+                '``[dev].mode = "reset"`` from cambrian.toml as well.'
+            ),
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Override external-write detection in reset mode. See `cambrian apply --help`.",
+        ),
+    ] = False,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Emit one JSON line per watch event."),
@@ -384,10 +525,10 @@ def watch_command(
 ) -> None:
     """Watch the migrations directory and re-apply ``current.sql`` on every change.
 
-    Idempotent-mode-only. Reset mode lands in M6's second PR (the same
-    binary, but ``--reset`` and ``[dev].mode = "reset"`` aren't honoured
-    at this milestone). On a parse or dispatch error, the loop reports
-    the error and keeps watching — the next save should fix things.
+    Default mode is idempotent — the safety contract. ``--reset`` (or
+    ``[dev].mode = "reset"``) enables the rollback-before-reapply path
+    for non-idempotent migrations. Use it sparingly. A parse or dispatch
+    error during a re-apply is reported and the loop keeps watching.
     """
     import asyncio as _asyncio
 
@@ -397,12 +538,16 @@ def watch_command(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    use_reset = reset or cfg.dev.mode == "reset"
+
     try:
         _asyncio.run(
             _watch_loop(
                 cfg,
                 debounce_ms=debounce_ms,
                 allow_partial=allow_partial,
+                use_reset=use_reset,
+                force=force,
                 json_output=as_json,
             )
         )
@@ -457,5 +602,50 @@ def _print_apply_human(result: Any) -> None:
                 typer.echo(f"        {s.notes}")
             if s.error:
                 typer.echo(f"        ! {s.error}", err=True)
+    if result.error:
+        typer.echo(f"error: {result.error}", err=True)
+
+
+def _reset_payload(result: Any) -> dict[str, Any]:
+    return {
+        "mode": "reset",
+        "status": result.status,
+        "migration_hash": result.migration_hash,
+        "rollback_event_id": result.rollback_event_id,
+        "apply_event_id": result.apply_event_id,
+        "sources": [str(p) for p in result.sources],
+        "rollbacks": [
+            {
+                "ident": r.ident,
+                "rolled_back": r.rolled_back,
+                "from_snapshot_id": r.from_snapshot_id,
+                "to_snapshot_id": r.to_snapshot_id,
+                "reason": r.reason,
+            }
+            for r in result.rollbacks
+        ],
+        "apply_result": (
+            _apply_payload(result.apply_result) if result.apply_result is not None else None
+        ),
+        "error": result.error,
+    }
+
+
+def _print_reset_human(result: Any) -> None:
+    typer.echo("mode:   reset (escape hatch — idempotent is the recommended path)")
+    typer.echo(f"status: {result.status}")
+    if result.migration_hash:
+        typer.echo(f"hash:   {result.migration_hash[:12]}…")
+    typer.echo(f"rollback event: {result.rollback_event_id or '<none>'}")
+    typer.echo(f"apply event:    {result.apply_event_id or '<none>'}")
+    if result.rollbacks:
+        typer.echo(f"rollbacks: {len(result.rollbacks)}")
+        for r in result.rollbacks:
+            marker = "rb" if r.rolled_back else "--"
+            arrow = f" {r.from_snapshot_id} -> {r.to_snapshot_id}" if r.rolled_back else ""
+            typer.echo(f"  [{marker}] {r.ident}{arrow} ({r.reason})")
+    if result.apply_result is not None:
+        typer.echo("apply phase:")
+        _print_apply_human(result.apply_result)
     if result.error:
         typer.echo(f"error: {result.error}", err=True)

@@ -122,21 +122,30 @@ async def _run_apply(
     *,
     allow_partial: bool,
     use_reset: bool,
+    force: bool = False,
 ) -> ApplyResult:
     """Off-thread apply.
 
     ``apply_idempotent`` is synchronous and IO-heavy; running it in a thread
-    keeps the watch loop responsive. The ``use_reset`` switch lights up in
-    PR-b; PR-a treats it as a hard error if the caller asks for it.
+    keeps the watch loop responsive. Under ``use_reset=True`` we run
+    :func:`apply_reset` and adapt its richer :class:`ResetResult` down to
+    an :class:`ApplyResult` shape so the watch loop's event payload stays
+    uniform regardless of mode.
     """
     if use_reset:
-        from cambrian.migrate import runner as _runner
+        from cambrian.migrate.runner import apply_reset
 
-        reset_fn = getattr(_runner, "apply_reset", None)
-        if reset_fn is None:
-            msg = "reset mode is not available in this build (PR-b not landed)"
-            raise CambrianError(msg)
-        return await asyncio.to_thread(reset_fn, config, allow_partial=allow_partial)
+        reset_result = await asyncio.to_thread(
+            apply_reset, config, allow_partial=allow_partial, force=force
+        )
+        return ApplyResult(
+            status=reset_result.status,
+            migration_hash=reset_result.migration_hash,
+            sources=reset_result.sources,
+            statements=(reset_result.apply_result.statements if reset_result.apply_result else []),
+            event_id=reset_result.apply_event_id,
+            error=reset_result.error,
+        )
     return await asyncio.to_thread(apply_idempotent, config, allow_partial=allow_partial)
 
 
@@ -146,6 +155,7 @@ async def watch(
     debounce_ms: int | None = None,
     allow_partial: bool = False,
     use_reset: bool = False,
+    force: bool = False,
     json_output: bool = False,
     stop_event: Event | None = None,
     watcher_factory: WatcherFactory | None = None,
@@ -172,8 +182,12 @@ async def watch(
         Override the config's debounce. ``None`` falls through to
         ``config.dev.debounce_ms``.
     use_reset:
-        Pass through to the runner. PR-a's wiring is inert (always uses
-        the idempotent runner); PR-b activates the reset path.
+        Run each apply in reset mode (rollback + re-apply via
+        :func:`apply_reset`). Default is idempotent; reset is the escape
+        hatch and the load-bearing principle is "idempotent is the path".
+    force:
+        Pass through to :func:`apply_reset` — overrides external-write
+        detection. No effect when ``use_reset=False``.
     json_output:
         If true, every event prints one JSON line; otherwise human-readable.
     stop_event:
@@ -203,7 +217,9 @@ async def watch(
     initial: ApplyResult | None = None
     if initial_apply:
         try:
-            initial = await _run_apply(config, allow_partial=allow_partial, use_reset=use_reset)
+            initial = await _run_apply(
+                config, allow_partial=allow_partial, use_reset=use_reset, force=force
+            )
         except CambrianError as err:
             await _emit(WatchEvent(kind="error", paths_changed=[], error=str(err)))
         else:
@@ -221,7 +237,9 @@ async def watch(
     async for batch in factory(watch_targets, debounce, stop_event):
         paths_changed = sorted({path for _, path in batch})
         try:
-            result = await _run_apply(config, allow_partial=allow_partial, use_reset=use_reset)
+            result = await _run_apply(
+                config, allow_partial=allow_partial, use_reset=use_reset, force=force
+            )
         except CambrianError as err:
             await _emit(WatchEvent(kind="error", paths_changed=paths_changed, error=str(err)))
             continue
