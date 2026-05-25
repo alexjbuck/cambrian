@@ -24,7 +24,7 @@ sibling in this module, not add their own private-API leak.
 
 from __future__ import annotations
 
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, RESTError
 from pyiceberg.table import Table
 from pyiceberg.table.refs import SnapshotRefType
 from pyiceberg.table.update import (
@@ -98,7 +98,13 @@ def restore_pointers(
         with table.transaction() as txn:
             # The sole _apply call site in cambrian; see module docstring.
             txn._apply(updates=updates, requirements=requirements)
-    except CommitFailedException as err:
+    except (CommitFailedException, RESTError) as err:
+        # Client-side: AssertRefSnapshotId raises CommitFailedException before
+        # the REST round-trip. Server-side: Lakekeeper rejects the staged
+        # commit because the table state at commit time disagrees with the
+        # requirement, surfacing as a RESTError subclass (BadRequestError,
+        # ServerError, …). Both paths map to "another writer moved main
+        # under us" — surface a single user-facing error type.
         raise ExternalWriteDetectedError(
             ref="main",
             expected_snapshot_id=expected_current_snapshot_id,
