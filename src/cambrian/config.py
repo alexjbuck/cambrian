@@ -107,18 +107,18 @@ class _SidecarCatalogOverride(BaseModel):
 
 
 class MigrationsConfig(BaseModel):
-    """Where migrations live on disk and how the sidecar is named."""
+    """Where migrations live on disk and how the sidecar is named.
+
+    The sidecar's table names (``events``, ``table_states``, ``version``) are
+    fixed internal constants; only the *namespace* is user-configurable.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     dir: str = Field(default="./migrations", description="Directory holding .sql migrations.")
     sidecar_namespace: str = Field(
         default="_cambrian",
-        description="Namespace that holds the sidecar migration_state table.",
-    )
-    sidecar_table: str = Field(
-        default="migration_state",
-        description="Name of the sidecar table tracking applied migrations.",
+        description="Namespace that holds the cambrian sidecar tables.",
     )
     sidecar_catalog: _SidecarCatalogOverride | None = Field(
         default=None,
