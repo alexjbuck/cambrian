@@ -87,8 +87,13 @@ is **never** the recommended fix — only the last resort.
 ## Stacked-PR workflow
 
 - Each milestone is its own branch off the prior PR's tip. Don't gate
-  later work on earlier merges. Open PRs incrementally; rebase the stack
-  as needed (or use graphite if set up).
+  later work on earlier merges. Open PRs incrementally.
+- **Graphite (`gt`) is the stack tool here.** Trunk is `main`; every
+  feat branch is tracked with its parent. Use `gt log` to see the
+  stack, `gt restack` after upstream changes, `gt submit --stack` to
+  align GitHub PR bases. Do not hand-rebase across the stack — it
+  breaks graphite metadata and you'll spend more time fixing it than
+  the manual rebase saved.
 - Fan out **independent** PRs to subagents in worktrees (`Agent` with
   `isolation: "worktree"`). Brief each agent self-containedly — they
   don't share context with the main loop.
@@ -114,6 +119,41 @@ these, leave a code comment and move on. No half-finished implementations.
 - `sql/` — dialect, include resolution, dispatch (M5)
 - `iceberg/` — transaction wrapper (rollback primitive), checkpoint,
   affected-table extraction (M4)
-- `sidecar/` — schema, bootstrap, events, self-migration (M3)
-- `migrate/` — runner, watch, commit, sync (M5–M8)
+- `sidecar/` — schema, bootstrap, events, self-migration (M3). The
+  module path keeps the word "migration" because these are
+  *sidecar-schema-version* migrations of cambrian's own bookkeeping
+  tables, not user-facing evolutions.
+- `migrate/` — runner, watch, commit, sync (M5–M8). Module path is
+  internal-only; renaming to `evolve/` would be a wider blast radius
+  than the semantic win justifies.
 - `docker/` — `compose.yml` + `bootstrap.sh` (M2)
+- `examples/` — self-contained docker stack + guided walkthrough for
+  first-time users. Uses different host ports (9181/9001/5433) than
+  the test rig (8181/9000/5432) so both can run simultaneously.
+
+## Known v1.x papercuts (post-V1 backlog)
+
+Surfaced while writing the examples walkthrough; not blockers for V1
+but worth knowing about so they don't get re-discovered:
+
+- `evolutions.dir` resolves relative to cwd, not the config file's
+  directory. `cambrian apply --path examples/cambrian.toml` from the
+  repo root looks for `./evolutions` at the repo root, not under
+  `examples/`. Fix: resolve relative to the config file (with an
+  opt-out for absolute paths).
+- `EvolutionNotFoundError` lands at generic exit code 1. Either add a
+  dedicated exit code or include an actionable hint in the error
+  ("create current.sql first, or run `cambrian init`").
+- `apply --json` payload's rendered SQL strings include sqlglot's
+  attached header comments as `/* ... */` prefixes on statement #1.
+  Either strip comments from the rendered-SQL field or attach header
+  comments to a synthetic head node.
+- `status --json` shows a stale `current_applied` field after commit
+  (it's the most-recent apply event for `evolution_id="current"`, not
+  "what's currently in current.sql"). Either rename or null when
+  `current.sql` is empty.
+- Custom sqlglot AST nodes (`AddPartitionField`, `WriteOrderedBy`,
+  `UnsetTblProperties`, etc.) have no SQL generator — calling
+  `.sql()` raises `ValueError`. The runner wraps with `_safe_sql`;
+  if you add a new custom node, either register a generator or only
+  call it via that helper.
