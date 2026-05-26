@@ -150,6 +150,53 @@ is a no-op — re-running on a flaky job is safe.
   files are skipped, and divergent files are refused (`--force` overrides,
   `--diff` prints a unified diff, `--dry-run` plans without writing).
 
+## Supported SQL
+
+Evolution files hold Iceberg DDL parsed by cambrian's sqlglot Spark dialect
+and applied in-process via PyIceberg. The full surface below is pinned by a
+corpus of statements in `tests/fixtures/iceberg_corpus.py` and exercised
+end-to-end against a live catalog.
+
+**Namespaces** — `CREATE NAMESPACE [IF NOT EXISTS] <ns> [WITH PROPERTIES (…)]`,
+`ALTER NAMESPACE <ns> SET PROPERTIES (…)`, `DROP NAMESPACE [IF EXISTS] <ns>`.
+
+**Tables** — `CREATE TABLE [IF NOT EXISTS] <t> (…) USING iceberg` with
+`PARTITIONED BY`, `LOCATION`, `COMMENT`, `TBLPROPERTIES`;
+`DROP TABLE [IF EXISTS] <t> [PURGE]`; `ALTER TABLE <t> RENAME TO <t2>`.
+
+- Column types: `boolean`, `int`/`bigint`, `float`/`double`, `decimal(p,s)`,
+  `string`, `binary`, `date`, `timestamp`, `timestamp_ntz`, `timestamptz`,
+  and nested `struct`/`array`/`map`.
+- Partition transforms: identity (bare column), `bucket(N, col)`,
+  `truncate(N, col)`, `year(s)`/`month(s)`/`day(s)`/`hour(s)`.
+
+**Schema evolution** — `ADD COLUMN[S]` (incl. nested dotted path, `COMMENT`,
+`NOT NULL`, `FIRST`/`AFTER`), `DROP COLUMN[S]`, `RENAME COLUMN`, and
+`ALTER COLUMN <c>` with `TYPE` / `COMMENT` / `SET`·`DROP NOT NULL` /
+`FIRST`·`AFTER`.
+
+**Partition evolution** — `ADD PARTITION FIELD <transform> [AS <name>]`,
+`DROP PARTITION FIELD <name | transform>`,
+`REPLACE PARTITION FIELD <old> WITH <transform> [AS <name>]`.
+
+**Sort order & write distribution** — `WRITE ORDERED BY …` (parenthesized or
+not, with `ASC`/`DESC` and `NULLS FIRST`/`LAST`), `WRITE LOCALLY ORDERED BY …`,
+`WRITE DISTRIBUTED BY PARTITION [LOCALLY ORDERED BY …]`, `WRITE UNORDERED`.
+
+**Properties & identifier fields** — `SET`/`UNSET TBLPROPERTIES (…)`;
+`SET`/`DROP IDENTIFIER FIELDS …`.
+
+**Data ops** (in-process) — `INSERT INTO <t> VALUES (…)`,
+`DELETE FROM <t> WHERE <predicate>`.
+
+Out of scope — refused with a clear unsupported-statement error rather than
+applied: row-level `UPDATE` / `MERGE` / `INSERT … SELECT`, branch/tag DDL
+(`CREATE`/`REPLACE`/`DROP BRANCH`|`TAG`), `CALL` maintenance procedures
+(`rewrite_data_files`, `expire_snapshots`, …), `CREATE TABLE … AS SELECT` and
+`CREATE OR REPLACE TABLE`, and time-travel reads (`… FOR VERSION`/`TIMESTAMP
+AS OF`). These need a query/compute engine or fall outside the
+idempotent-evolution model.
+
 ## Exit codes
 
 | Code | Meaning                                       |

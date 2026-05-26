@@ -24,6 +24,7 @@ from pyiceberg.transforms import (
     BucketTransform,
     DayTransform,
     IdentityTransform,
+    TruncateTransform,
     YearTransform,
 )
 from pyiceberg.types import (
@@ -32,8 +33,13 @@ from pyiceberg.types import (
     DecimalType,
     DoubleType,
     IntegerType,
+    ListType,
     LongType,
+    MapType,
+    NestedField,
     StringType,
+    StructType,
+    TimestampType,
     TimestamptzType,
 )
 
@@ -55,7 +61,15 @@ def _single(sql: str):
 
 def _make_catalog() -> MagicMock:
     return MagicMock(
-        spec_set=["create_namespace", "drop_namespace", "create_table", "drop_table", "load_table"]
+        spec_set=[
+            "create_namespace",
+            "drop_namespace",
+            "update_namespace_properties",
+            "create_table",
+            "drop_table",
+            "rename_table",
+            "load_table",
+        ]
     )
 
 
@@ -174,10 +188,12 @@ def test_create_table_already_exists_is_idempotent() -> None:
 
 def test_create_table_unsupported_type() -> None:
     catalog = _make_catalog()
+    # STRUCT/ARRAY/MAP are now in scope; INTERVAL is a primitive cambrian
+    # doesn't map, so it stays unsupported.
     with pytest.raises(UnsupportedStatementError):
         dispatch(
             catalog,
-            _single("CREATE TABLE foo.t (a STRUCT<x: INT>) USING iceberg"),
+            _single("CREATE TABLE foo.t (a INTERVAL) USING iceberg"),
         )
 
 
@@ -516,3 +532,290 @@ def test_transform_day_parses() -> None:
     us = table.update_spec.return_value.__enter__.return_value
     args = us.add_field.call_args.args
     assert isinstance(args[1], DayTransform)
+
+
+# ---------------------------------------------------------------------------
+# truncate partition transform (sqlglot Trunc node shape)
+# ---------------------------------------------------------------------------
+
+
+def test_add_partition_field_truncate() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ADD PARTITION FIELD truncate(4, data)"))
+    us = table.update_spec.return_value.__enter__.return_value
+    args = us.add_field.call_args.args
+    assert args[0] == "data"
+    assert isinstance(args[1], TruncateTransform)
+    assert args[1].width == 4
+
+
+def test_replace_partition_field_with_truncate() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(
+        catalog,
+        _single("ALTER TABLE foo.t REPLACE PARTITION FIELD x WITH truncate(8, data)"),
+    )
+    us = table.update_spec.return_value.__enter__.return_value
+    args = us.add_field.call_args.args
+    assert args[0] == "data"
+    assert isinstance(args[1], TruncateTransform)
+    assert args[1].width == 8
+
+
+# ---------------------------------------------------------------------------
+# Nested CREATE TABLE types
+# ---------------------------------------------------------------------------
+
+
+def test_create_table_struct() -> None:
+    catalog = _make_catalog()
+    dispatch(
+        catalog,
+        _single("CREATE TABLE foo.t (point STRUCT<x: DOUBLE, y: DOUBLE>) USING iceberg"),
+    )
+    schema = catalog.create_table.call_args.kwargs["schema"]
+    assert isinstance(schema.fields[0].field_type, StructType)
+    assert [f.name for f in schema.fields[0].field_type.fields] == ["x", "y"]
+
+
+def test_create_table_array() -> None:
+    catalog = _make_catalog()
+    dispatch(catalog, _single("CREATE TABLE foo.t (tags ARRAY<STRING>) USING iceberg"))
+    schema = catalog.create_table.call_args.kwargs["schema"]
+    assert isinstance(schema.fields[0].field_type, ListType)
+
+
+def test_create_table_map() -> None:
+    catalog = _make_catalog()
+    dispatch(catalog, _single("CREATE TABLE foo.t (attrs MAP<STRING, INT>) USING iceberg"))
+    schema = catalog.create_table.call_args.kwargs["schema"]
+    assert isinstance(schema.fields[0].field_type, MapType)
+
+
+def test_create_table_nested_combo_unique_ids() -> None:
+    catalog = _make_catalog()
+    dispatch(
+        catalog,
+        _single(
+            "CREATE TABLE foo.t ("
+            "points ARRAY<STRUCT<x: DOUBLE, y: DOUBLE>>, lookup MAP<STRING, ARRAY<INT>>"
+            ") USING iceberg"
+        ),
+    )
+    schema = catalog.create_table.call_args.kwargs["schema"]
+    # Every field id across the whole (nested) schema must be unique.
+    ids = [f.field_id for f in schema._lazy_id_to_field.values()]
+    assert len(ids) == len(set(ids))
+
+
+def test_create_table_timestamp_ntz_maps_to_no_tz() -> None:
+    catalog = _make_catalog()
+    dispatch(catalog, _single("CREATE TABLE foo.t (i TIMESTAMP_NTZ) USING iceberg"))
+    schema = catalog.create_table.call_args.kwargs["schema"]
+    assert type(schema.fields[0].field_type) is TimestampType
+
+
+def test_create_or_replace_table_rejected() -> None:
+    catalog = _make_catalog()
+    with pytest.raises(UnsupportedStatementError):
+        dispatch(catalog, _single("CREATE OR REPLACE TABLE foo.t (id INT) USING iceberg"))
+
+
+def test_ctas_rejected() -> None:
+    catalog = _make_catalog()
+    with pytest.raises(UnsupportedStatementError):
+        dispatch(catalog, _single("CREATE TABLE foo.t USING iceberg AS SELECT * FROM bar"))
+
+
+# ---------------------------------------------------------------------------
+# RENAME TABLE
+# ---------------------------------------------------------------------------
+
+
+def test_rename_table_calls_catalog() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t RENAME TO foo.t2"))
+    catalog.rename_table.assert_called_once_with(("foo", "t"), ("foo", "t2"))
+
+
+def test_rename_table_idempotent_when_source_absent() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    catalog.rename_table.side_effect = NoSuchTableError("gone")
+    result = dispatch(catalog, _single("ALTER TABLE foo.t RENAME TO foo.t2"))
+    assert "idempotent" in result.notes
+
+
+# ---------------------------------------------------------------------------
+# ALTER COLUMN comment / not null / reposition
+# ---------------------------------------------------------------------------
+
+
+def test_alter_column_comment_only() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ALTER COLUMN c COMMENT 'docs'"))
+    us = table.update_schema.return_value.__enter__.return_value
+    assert us.update_column.call_args.kwargs["doc"] == "docs"
+
+
+def test_alter_column_set_not_null() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ALTER COLUMN id SET NOT NULL"))
+    us = table.update_schema.return_value.__enter__.return_value
+    assert us.update_column.call_args.kwargs["required"] is True
+
+
+def test_alter_column_drop_not_null() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ALTER COLUMN id DROP NOT NULL"))
+    us = table.update_schema.return_value.__enter__.return_value
+    assert us.update_column.call_args.kwargs["required"] is False
+
+
+def test_alter_column_first() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ALTER COLUMN c FIRST"))
+    us = table.update_schema.return_value.__enter__.return_value
+    us.move_first.assert_called_once_with("c")
+
+
+def test_alter_column_after() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ALTER COLUMN c AFTER name"))
+    us = table.update_schema.return_value.__enter__.return_value
+    us.move_after.assert_called_once_with("c", "name")
+
+
+def test_add_column_dotted_path_uses_tuple() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t ADD COLUMN point.z DOUBLE"))
+    us = table.update_schema.return_value.__enter__.return_value
+    assert us.add_column.call_args.args[0] == ("point", "z")
+
+
+# ---------------------------------------------------------------------------
+# Identifier fields
+# ---------------------------------------------------------------------------
+
+
+def test_set_identifier_fields() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t SET IDENTIFIER FIELDS id, name"))
+    us = table.update_schema.return_value.__enter__.return_value
+    us.set_identifier_fields.assert_called_once_with("id", "name")
+
+
+def test_drop_identifier_fields_resets_remaining() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    real_schema = Schema(
+        NestedField(field_id=1, name="id", field_type=IntegerType(), required=True),
+        NestedField(field_id=2, name="name", field_type=StringType(), required=True),
+        identifier_field_ids=[1, 2],
+    )
+    table.schema.return_value = real_schema
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t DROP IDENTIFIER FIELDS name"))
+    us = table.update_schema.return_value.__enter__.return_value
+    us.set_identifier_fields.assert_called_once_with("id")
+
+
+# ---------------------------------------------------------------------------
+# WRITE distribution family
+# ---------------------------------------------------------------------------
+
+
+def test_write_ordered_by_sets_range_mode() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t WRITE ORDERED BY category, id"))
+    txn = table.transaction.return_value.__enter__.return_value
+    assert txn.set_properties.call_args.kwargs["properties"] == {"write.distribution-mode": "range"}
+
+
+def test_write_locally_ordered_sets_none_mode() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t WRITE LOCALLY ORDERED BY category, id"))
+    txn = table.transaction.return_value.__enter__.return_value
+    assert txn.set_properties.call_args.kwargs["properties"] == {"write.distribution-mode": "none"}
+    table.update_sort_order.assert_called()
+
+
+def test_write_distributed_sets_hash_mode() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t WRITE DISTRIBUTED BY PARTITION"))
+    txn = table.transaction.return_value.__enter__.return_value
+    assert txn.set_properties.call_args.kwargs["properties"] == {"write.distribution-mode": "hash"}
+
+
+def test_write_unordered_clears_sort_order() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("ALTER TABLE foo.t WRITE UNORDERED"))
+    table.update_sort_order.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# DELETE FROM
+# ---------------------------------------------------------------------------
+
+
+def test_delete_where_calls_delete_with_filter() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("DELETE FROM foo.t WHERE id = 1"))
+    table.delete.assert_called_once()
+    assert "id = 1" in table.delete.call_args.kwargs["delete_filter"]
+
+
+def test_delete_no_where_deletes_all() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    dispatch(catalog, _single("DELETE FROM foo.t"))
+    table.delete.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Namespace properties
+# ---------------------------------------------------------------------------
+
+
+def test_create_namespace_with_properties() -> None:
+    catalog = _make_catalog()
+    dispatch(catalog, _single("CREATE NAMESPACE foo WITH PROPERTIES ('owner' = 'eng')"))
+    catalog.create_namespace.assert_called_once_with("foo", properties={"owner": "eng"})
+
+
+def test_alter_namespace_set_properties() -> None:
+    catalog = _make_catalog()
+    dispatch(catalog, _single("ALTER NAMESPACE foo SET PROPERTIES ('owner' = 'data')"))
+    catalog.update_namespace_properties.assert_called_once_with("foo", updates={"owner": "data"})

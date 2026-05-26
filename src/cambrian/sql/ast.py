@@ -111,3 +111,63 @@ class UnsetTblProperties(exp.Expression):
     """
 
     arg_types: t.ClassVar[dict[str, bool]] = {"expressions": True}
+
+
+class WriteDistribution(exp.Expression):
+    """``ALTER TABLE t WRITE [LOCALLY] ORDERED BY ... | DISTRIBUTED BY PARTITION | UNORDERED``.
+
+    A single node covers the whole ``WRITE`` distribution-mode family because
+    they all map to the same two PyIceberg levers — the table's sort order and
+    the ``write.distribution-mode`` property. ``mode`` is one of ``"range"``
+    (ORDERED BY), ``"none"`` (LOCALLY ORDERED BY / no global shuffle),
+    ``"hash"`` (DISTRIBUTED BY PARTITION), or ``"unordered"`` (clear the sort
+    order). ``expressions`` carries the :class:`sqlglot.exp.Ordered` sort
+    columns (empty for DISTRIBUTED-only / UNORDERED).
+    """
+
+    arg_types: t.ClassVar[dict[str, bool]] = {"mode": True, "expressions": False}
+
+
+class SetIdentifierFields(exp.Expression):
+    """``ALTER TABLE t SET IDENTIFIER FIELDS a, b``.
+
+    ``expressions`` is the list of column references that become the table's
+    identifier fields (Iceberg's row-uniqueness key for V2 tables).
+    """
+
+    arg_types: t.ClassVar[dict[str, bool]] = {"expressions": True}
+
+
+class DropIdentifierFields(exp.Expression):
+    """``ALTER TABLE t DROP IDENTIFIER FIELDS a, b``.
+
+    ``expressions`` is the list of column references to remove from the
+    identifier-field set. Dropping every current identifier field clears it.
+    """
+
+    arg_types: t.ClassVar[dict[str, bool]] = {"expressions": True}
+
+
+class AlterColumnPosition(exp.Expression):
+    """``ALTER TABLE t ALTER COLUMN c FIRST | AFTER other``.
+
+    A position-only reorder. Stock Spark leaves the trailing ``FIRST``/
+    ``AFTER`` unconsumed (the statement falls to ``Command``), so the dialect
+    intercepts it and emits this node. ``this`` is the column to move;
+    ``position`` is ``"FIRST"`` or ``"AFTER"``; ``after`` is the anchor column
+    for the ``AFTER`` case.
+    """
+
+    arg_types: t.ClassVar[dict[str, bool]] = {"this": True, "position": True, "after": False}
+
+
+class AlterNamespaceProperties(exp.Expression):
+    """``ALTER NAMESPACE ns SET PROPERTIES (...)``.
+
+    Stock Spark has no ``NAMESPACE`` in its ``ALTERABLES`` set, so the whole
+    statement falls back to ``Command``; the dialect intercepts it and emits
+    this node. ``this`` is the namespace identifier; ``expressions`` is the
+    parsed property list.
+    """
+
+    arg_types: t.ClassVar[dict[str, bool]] = {"this": True, "expressions": True}

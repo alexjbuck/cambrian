@@ -11,6 +11,7 @@ contributors who only care about unit tests aren't blocked.
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import subprocess
 import time
@@ -113,6 +114,29 @@ def compose_stack() -> Iterator[None]:
         yield
     finally:
         subprocess.run([*compose_cmd, "down", "-v"], check=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _raise_open_file_limit() -> None:
+    """Raise the session's soft open-file limit.
+
+    The integration suite reaches rustfs through PyArrow's ``S3FileSystem``,
+    which keeps per-filesystem connection pools, and uses watchfiles for the
+    watch tests — together that needs far more file descriptors than macOS's
+    default soft limit of 256. Without headroom the later tests in a run fail
+    with "Too many open files" (or a PyArrow socket/thread-start error, which
+    is the same exhaustion). Raise toward a generous target, capped by the
+    hard limit and whatever the OS will accept.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for target in (8192, 4096, 2048, 1024):
+        if target <= soft or (hard != resource.RLIM_INFINITY and target > hard):
+            continue
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            return
+        except (ValueError, OSError):
+            continue
 
 
 @pytest.fixture(scope="session")
