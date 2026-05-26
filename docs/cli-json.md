@@ -8,6 +8,11 @@ The schemas below use a relaxed JSON-Schema notation: `string`, `int`,
 `bool`, `list[T]`, `T | null` for optionality, `dict` for an unparsed
 object.
 
+Inside cambrian the canonical noun is **evolution** (matching Iceberg's
+"schema evolution" / "partition evolution" vocabulary). The top-level
+README uses "migration" framing for discoverability — the JSON field
+names below all use `evolution_*`.
+
 ## Exit codes
 
 | Code | Meaning                                            |
@@ -27,14 +32,14 @@ follow the same table.
 {
   "mode":            "idempotent",
   "status":          "unchanged" | "applied" | "partial",
-  "migration_id":    "current",
-  "migration_hash":  string,           // sha256 of expanded current.sql
+  "evolution_id":    "current",
+  "evolution_hash":  string,           // sha256 of expanded current.sql
   "event_id":        string | null,    // null when no work was done
   "sources":         list[string],     // paths walked via --! include
   "applied_committed": list[{
-    "migration_id":   string,          // "NNNN_<slug>"
+    "evolution_id":   string,          // "NNNN_<slug>"
     "status":         "applied" | "unchanged" | "partial",
-    "migration_hash": string,
+    "evolution_hash": string,
     "event_id":       string | null,
     "error":          string | null
   }],
@@ -54,7 +59,7 @@ follow the same table.
 {
   "mode":              "reset",
   "status":            "applied" | "rolled-back" | "partial" | "no-change",
-  "migration_hash":    string | null,
+  "evolution_hash":    string | null,
   "rollback_event_id": string | null,
   "apply_event_id":    string | null,
   "sources":           list[string],
@@ -76,9 +81,9 @@ follow the same table.
 
 ```
 {
-  "migration_id":     string,         // "NNNN_<slug>"
+  "evolution_id":     string,         // "NNNN_<slug>"
   "committed_path":   string,
-  "migration_hash":   string,
+  "evolution_hash":   string,
   "tag_ref":          string,         // "cambrian.committed.<n>.<slug>"
   "event_id":         string | null,
   "affected_tables":  list[string]
@@ -89,7 +94,7 @@ follow the same table.
 
 ```
 {
-  "migration_id":       string,
+  "evolution_id":       string,
   "restored_path":      string,
   "restored_to_current": true,
   "event_id":           string | null,
@@ -98,12 +103,12 @@ follow the same table.
 }
 ```
 
-## `cambrian reset-to <migration_id> [--json]`
+## `cambrian reset-to <evolution_id> [--json]`
 
 ```
 {
   "mode":               "reset --to",
-  "migration_id":       string,
+  "evolution_id":       string,
   "event_id":           string | null,
   "rolled_back_tables": list[string],
   "skipped_tables":     list[string]
@@ -121,7 +126,7 @@ follow the same table.
   "refused":        int,
   "discrepancies":  int,
   "files": list[{
-    "migration_id":  string,
+    "evolution_id":  string,
     "path":          string,
     "status":        "written" | "overwritten" | "skipped" | "refused" | "discrepancy",
     "catalog_hash":  string | null,
@@ -144,15 +149,15 @@ drifted checkout.
   "sidecar_version":     int,
   "is_version_ahead":    bool,
   "committed_count":     int,
-  "committed_migrations": list[{
-    "migration_id":  string,
+  "committed_evolutions": list[{
+    "evolution_id":  string,
     "event_id":      string,
     "event_ts":      string         // ISO-8601
   }],
   "current_applied": null | {
     "event_id":       string,
     "event_ts":       string,
-    "migration_hash": string
+    "evolution_hash": string
   }
 }
 ```

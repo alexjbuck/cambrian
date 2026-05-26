@@ -7,7 +7,7 @@ event is emitted regardless of full/partial success, carrying the new hash,
 the full expanded SQL, and one ``table_states`` row per affected table.
 
 Reset mode (``apply_reset``) is the opt-in path for non-idempotent
-migrations. It captures (or reuses) checkpoints for every affected table,
+evolutions. It captures (or reuses) checkpoints for every affected table,
 detects out-of-band writes via the four-pointer atomic restore's
 ``AssertRefSnapshotId`` requirement, rolls the tables back, re-executes the
 expanded SQL, and emits two events (``rollback`` then ``apply``) so the
@@ -30,9 +30,9 @@ from sqlglot import expressions as exp
 from cambrian.catalog import load_catalog
 from cambrian.errors import (
     CambrianError,
+    EvolutionNotFoundError,
     ExternalWriteDetectedError,
     IllegalStateError,
-    MigrationNotFoundError,
 )
 from cambrian.iceberg.affected import (
     TableIdent,
@@ -69,9 +69,9 @@ __all__ = [
     "rollback_to_last_checkpoint",
 ]
 
-# Migration id used for the dev-loop ``current.sql`` slot. Reset's checkpoint
-# tag is ``cambrian.cp.<migration_id>`` (per CLAUDE.md) → ``cambrian.cp.current``.
-CURRENT_MIGRATION_ID = "current"
+# Evolution id used for the dev-loop ``current.sql`` slot. Reset's checkpoint
+# tag is ``cambrian.cp.<evolution_id>`` (per CLAUDE.md) → ``cambrian.cp.current``.
+CURRENT_EVOLUTION_ID = "current"
 CHECKPOINT_TAG_PREFIX = "cambrian.cp."
 
 
@@ -87,11 +87,11 @@ class StatementResult:
 
 @dataclass
 class CommittedApplyResult:
-    """Outcome of replaying a single committed migration."""
+    """Outcome of replaying a single committed evolution."""
 
-    migration_id: str
+    evolution_id: str
     status: str
-    migration_hash: str
+    evolution_hash: str
     event_id: str | None = None
     error: str | None = None
 
@@ -104,19 +104,19 @@ class ApplyResult:
     (every statement succeeded), or ``"partial"`` (at least one statement
     failed but the runner continued under ``allow_partial=True``).
 
-    ``applied_committed`` is the list of committed migrations replayed by
+    ``applied_committed`` is the list of committed evolutions replayed by
     this invocation (empty when current.sql is the only thing in flight or
     the replay was a no-op).
     """
 
     status: str
-    migration_hash: str
+    evolution_hash: str
     sources: list[Path] = field(default_factory=list)
     statements: list[StatementResult] = field(default_factory=list)
     event_id: str | None = None
     error: str | None = None
     applied_committed: list[CommittedApplyResult] = field(default_factory=list)
-    migration_id: str = "current"
+    evolution_id: str = "current"
 
 
 def apply_idempotent(
@@ -125,30 +125,30 @@ def apply_idempotent(
     allow_partial: bool = False,
     actor: str | None = None,
 ) -> ApplyResult:
-    """Apply committed migrations + ``current.sql`` in idempotent mode.
+    """Apply committed evolutions + ``current.sql`` in idempotent mode.
 
     Steps:
 
-    1. Replay any committed migrations not yet present in the events log
+    1. Replay any committed evolutions not yet present in the events log
        (post-hoc edit detection refuses on hash mismatch with a prior
-       apply event for that migration_id).
+       apply event for that evolution_id).
     2. Expand ``current.sql`` + hash.
     3. Load catalog; ``ensure_current`` on the sidecar.
-    4. Check the last ``apply`` event for ``migration_id="current"``. If its
-       ``migration_hash`` matches the new one: no-op.
+    4. Check the last ``apply`` event for ``evolution_id="current"``. If its
+       ``evolution_hash`` matches the new one: no-op.
     5. Parse all statements via :class:`CambrianSpark`.
     6. For each statement: capture pre-state, dispatch, capture post-state.
     7. Emit one ``apply`` event with the full expanded SQL and N
        ``table_states`` rows.
 
     Raises:
-        MigrationNotFoundError: ``current.sql`` doesn't exist.
+        EvolutionNotFoundError: ``current.sql`` doesn't exist.
         IllegalStateError: a committed file's content diverges from the
             hash recorded in a prior apply event (post-hoc edit).
         CambrianError: Various — see :mod:`cambrian.errors`.
     """
     catalog = load_catalog(config)
-    state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
+    state = ensure_current(catalog, config.evolutions.sidecar_namespace, allow_read_only=False)
     namespace = state.sidecar_namespace
 
     replay_results = replay_committed(
@@ -162,11 +162,11 @@ def apply_idempotent(
     current_sql_path = _resolve_current_sql(config)
     expanded = expand(current_sql_path)
 
-    last = latest_event(catalog, namespace, event_type="apply", migration_id="current")
-    if last is not None and last.migration_hash == expanded.hash:
+    last = latest_event(catalog, namespace, event_type="apply", evolution_id="current")
+    if last is not None and last.evolution_hash == expanded.hash:
         return ApplyResult(
             status="unchanged",
-            migration_hash=expanded.hash,
+            evolution_hash=expanded.hash,
             sources=expanded.sources,
             applied_committed=replay_results,
         )
@@ -227,9 +227,9 @@ def apply_idempotent(
         catalog,
         namespace,
         event_type="apply",
-        migration_id="current",
-        migration_hash=expanded.hash,
-        migration_sql=expanded.text,
+        evolution_id="current",
+        evolution_hash=expanded.hash,
+        evolution_sql=expanded.text,
         actor=actor or _default_actor(),
         notes=notes,
         table_states=[acc.to_row() for acc in state_by_ident.values()],
@@ -244,7 +244,7 @@ def apply_idempotent(
 
     return ApplyResult(
         status=status,
-        migration_hash=expanded.hash,
+        evolution_hash=expanded.hash,
         sources=expanded.sources,
         statements=statement_results,
         event_id=event_id,
@@ -273,23 +273,23 @@ def replay_committed(
     allow_partial: bool = False,
     actor: str | None = None,
 ) -> list[CommittedApplyResult]:
-    """Replay every committed migration not yet recorded in the events log.
+    """Replay every committed evolution not yet recorded in the events log.
 
     Walks ``committed/`` lexicographically. For each ``NNNN_<slug>.sql``:
 
-    * If a prior ``apply`` event exists for that ``migration_id``:
+    * If a prior ``apply`` event exists for that ``evolution_id``:
       - hash matches → skip (already applied);
       - hash mismatch → refuse with :class:`IllegalStateError`
         (post-hoc edit of a committed file).
     * Otherwise dispatch the SQL via the same path used for ``current.sql``
-      and emit an ``apply`` event keyed on the migration_id.
+      and emit an ``apply`` event keyed on the evolution_id.
 
     Returns one :class:`CommittedApplyResult` per file processed.
     """
     from cambrian.migrate.commit import discover_committed_files
 
-    migrations_dir = Path(config.migrations.dir).resolve()
-    committed_dir = migrations_dir / "committed"
+    evolutions_dir = Path(config.evolutions.dir).resolve()
+    committed_dir = evolutions_dir / "committed"
     files = discover_committed_files(committed_dir)
     if not files:
         return []
@@ -301,20 +301,20 @@ def replay_committed(
         text = cf.path.read_text(encoding="utf-8")
         digest = _sha256_hex(text)
 
-        prior_hash = applied.get(cf.migration_id)
+        prior_hash = applied.get(cf.evolution_id)
         if prior_hash is not None:
             if prior_hash != digest:
                 raise IllegalStateError(
                     f"committed file {cf.path.name} has been edited since it was applied "
                     f"(recorded hash {prior_hash[:12]}…, current hash {digest[:12]}…). "
-                    "Committed migrations are immutable history — restore the file from "
+                    "Committed evolutions are immutable history — restore the file from "
                     "git or run `cambrian sync` to reconcile against the catalog."
                 )
             results.append(
                 CommittedApplyResult(
-                    migration_id=cf.migration_id,
+                    evolution_id=cf.evolution_id,
                     status="unchanged",
-                    migration_hash=digest,
+                    evolution_hash=digest,
                 )
             )
             continue
@@ -322,7 +322,7 @@ def replay_committed(
         result = _apply_one_committed_text(
             catalog,
             namespace,
-            migration_id=cf.migration_id,
+            evolution_id=cf.evolution_id,
             text=text,
             digest=digest,
             sources=[cf.path],
@@ -331,16 +331,16 @@ def replay_committed(
         )
         results.append(
             CommittedApplyResult(
-                migration_id=cf.migration_id,
+                evolution_id=cf.evolution_id,
                 status=result.status,
-                migration_hash=result.migration_hash,
+                evolution_hash=result.evolution_hash,
                 event_id=result.event_id,
                 error=result.error,
             )
         )
         if result.error is not None and not allow_partial:
             raise IllegalStateError(
-                f"failed replaying committed migration {cf.migration_id}: {result.error}"
+                f"failed replaying committed evolution {cf.evolution_id}: {result.error}"
             )
     return results
 
@@ -355,17 +355,17 @@ def _apply_one_committed_text(
     catalog: Catalog,
     namespace: str,
     *,
-    migration_id: str,
+    evolution_id: str,
     text: str,
     digest: str,
     sources: list[Path],
     allow_partial: bool,
     actor: str | None,
 ) -> ApplyResult:
-    """Dispatch one committed migration's SQL and emit an ``apply`` event for it.
+    """Dispatch one committed evolution's SQL and emit an ``apply`` event for it.
 
     Mirrors the body of :func:`apply_idempotent` but keyed on a stable
-    ``migration_id`` (the ``NNNN_<slug>`` form) rather than ``"current"``.
+    ``evolution_id`` (the ``NNNN_<slug>`` form) rather than ``"current"``.
     """
     statements_raw = sqlglot.parse(text, dialect=CambrianSpark)
     statements = [s for s in statements_raw if s is not None]
@@ -408,9 +408,9 @@ def _apply_one_committed_text(
         catalog,
         namespace,
         event_type="apply",
-        migration_id=migration_id,
-        migration_hash=digest,
-        migration_sql=text,
+        evolution_id=evolution_id,
+        evolution_hash=digest,
+        evolution_sql=text,
         actor=actor or _default_actor(),
         notes=notes,
         table_states=[acc.to_row() for acc in state_by_ident.values()],
@@ -421,7 +421,7 @@ def _apply_one_committed_text(
 
     return ApplyResult(
         status=status,
-        migration_hash=digest,
+        evolution_hash=digest,
         sources=sources,
         statements=statement_results,
         event_id=event_id,
@@ -435,12 +435,12 @@ def _apply_one_committed_text(
 
 
 def _resolve_current_sql(config: CambrianConfig) -> Path:
-    base = Path(config.migrations.dir).resolve()
+    base = Path(config.evolutions.dir).resolve()
     candidate = base / "current.sql"
     if not candidate.exists():
-        raise MigrationNotFoundError(
+        raise EvolutionNotFoundError(
             f"current.sql not found at {candidate} "
-            f"(config: migrations.dir = {config.migrations.dir})"
+            f"(config: evolutions.dir = {config.evolutions.dir})"
         )
     return candidate
 
@@ -588,7 +588,7 @@ class ResetResult:
     """
 
     status: str
-    migration_hash: str
+    evolution_hash: str
     sources: list[Path] = field(default_factory=list)
     rollbacks: list[TableRollback] = field(default_factory=list)
     apply_result: ApplyResult | None = None
@@ -597,8 +597,8 @@ class ResetResult:
     error: str | None = None
 
 
-def _checkpoint_tag(migration_id: str) -> str:
-    return f"{CHECKPOINT_TAG_PREFIX}{migration_id}"
+def _checkpoint_tag(evolution_id: str) -> str:
+    return f"{CHECKPOINT_TAG_PREFIX}{evolution_id}"
 
 
 def _row_to_checkpoint(row: TableStateRow) -> Checkpoint | None:
@@ -628,7 +628,7 @@ def _load_prior_checkpoints(
     catalog: Catalog,
     namespace: str,
     *,
-    migration_id: str,
+    evolution_id: str,
 ) -> dict[str, Checkpoint]:
     """Read every per-table checkpoint stashed by the most recent ``rollback`` event.
 
@@ -640,7 +640,7 @@ def _load_prior_checkpoints(
 
     Returns an empty dict if no prior rollback event exists.
     """
-    prior = latest_event(catalog, namespace, event_type="rollback", migration_id=migration_id)
+    prior = latest_event(catalog, namespace, event_type="rollback", evolution_id=evolution_id)
     if prior is None:
         return {}
     rows = table_states_for_event(catalog, namespace, event_id=prior.event_id)
@@ -656,15 +656,15 @@ def _load_post_snapshots(
     catalog: Catalog,
     namespace: str,
     *,
-    migration_id: str,
+    evolution_id: str,
 ) -> dict[str, int | None]:
-    """Return {ident_str: post_snapshot_id} from the most recent ``apply`` for *migration_id*.
+    """Return {ident_str: post_snapshot_id} from the most recent ``apply`` for *evolution_id*.
 
     Used by external-write detection: compare each table's current main
     snapshot against the *post* state recorded by the prior apply. A
     divergence means someone else wrote between then and now.
     """
-    prior = latest_event(catalog, namespace, event_type="apply", migration_id=migration_id)
+    prior = latest_event(catalog, namespace, event_type="apply", evolution_id=evolution_id)
     if prior is None:
         return {}
     rows = table_states_for_event(catalog, namespace, event_id=prior.event_id)
@@ -707,7 +707,7 @@ def apply_reset(
     current_sql_path = _resolve_current_sql(config)
     expanded = expand(current_sql_path)
     catalog = load_catalog(config)
-    state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
+    state = ensure_current(catalog, config.evolutions.sidecar_namespace, allow_read_only=False)
     namespace = state.sidecar_namespace
 
     statements_raw = sqlglot.parse(expanded.text, dialect=CambrianSpark)
@@ -716,10 +716,10 @@ def apply_reset(
     idents = _unique_tables(per_stmt_tables)
 
     prior_checkpoints = _load_prior_checkpoints(
-        catalog, namespace, migration_id=CURRENT_MIGRATION_ID
+        catalog, namespace, evolution_id=CURRENT_EVOLUTION_ID
     )
     prior_post_snapshots = _load_post_snapshots(
-        catalog, namespace, migration_id=CURRENT_MIGRATION_ID
+        catalog, namespace, evolution_id=CURRENT_EVOLUTION_ID
     )
 
     if not force:
@@ -738,7 +738,7 @@ def apply_reset(
     # is what the *next* reset will roll back to — captured before phase 2
     # so it survives the upcoming rollback.
     pre_reset_states: dict[str, Checkpoint] = {}
-    tag_name = _checkpoint_tag(CURRENT_MIGRATION_ID)
+    tag_name = _checkpoint_tag(CURRENT_EVOLUTION_ID)
     for ident in idents:
         table = _load_or_none(catalog, ident)
         if table is None:
@@ -807,7 +807,7 @@ def apply_reset(
     except CambrianError as err:
         return ResetResult(
             status="partial",
-            migration_hash=expanded.hash,
+            evolution_hash=expanded.hash,
             sources=expanded.sources,
             rollbacks=rollbacks,
             error=str(err),
@@ -844,9 +844,9 @@ def apply_reset(
         catalog,
         namespace,
         event_type="rollback",
-        migration_id=CURRENT_MIGRATION_ID,
-        migration_hash=expanded.hash,
-        migration_sql=expanded.text,
+        evolution_id=CURRENT_EVOLUTION_ID,
+        evolution_hash=expanded.hash,
+        evolution_sql=expanded.text,
         actor=actor or _default_actor(),
         notes=(
             f"rolled back {sum(1 for r in rollbacks if r.rolled_back)} "
@@ -858,7 +858,7 @@ def apply_reset(
 
     return ResetResult(
         status=apply_result.status,
-        migration_hash=expanded.hash,
+        evolution_hash=expanded.hash,
         sources=expanded.sources,
         rollbacks=rollbacks,
         apply_result=apply_result,
@@ -886,17 +886,17 @@ def rollback_to_last_checkpoint(
     touch different tables.
     """
     catalog = load_catalog(config)
-    state = ensure_current(catalog, config.migrations.sidecar_namespace, allow_read_only=False)
+    state = ensure_current(catalog, config.evolutions.sidecar_namespace, allow_read_only=False)
     namespace = state.sidecar_namespace
 
-    prior = latest_event(catalog, namespace, event_type="apply", migration_id=CURRENT_MIGRATION_ID)
+    prior = latest_event(catalog, namespace, event_type="apply", evolution_id=CURRENT_EVOLUTION_ID)
     if prior is None:
         # Nothing has been applied; nothing to roll back. Surface a
         # ResetResult with status=unchanged so callers can render a
         # sensible message.
         return ResetResult(
             status="unchanged",
-            migration_hash="",
+            evolution_hash="",
             sources=[],
             rollbacks=[],
         )
@@ -971,9 +971,9 @@ def rollback_to_last_checkpoint(
         catalog,
         namespace,
         event_type="rollback",
-        migration_id=CURRENT_MIGRATION_ID,
-        migration_hash=prior.migration_hash,
-        migration_sql=prior.migration_sql,
+        evolution_id=CURRENT_EVOLUTION_ID,
+        evolution_hash=prior.evolution_hash,
+        evolution_sql=prior.evolution_sql,
         actor=actor or _default_actor(),
         notes=f"manual rollback of {sum(1 for r in rollbacks if r.rolled_back)} tables",
         table_states=rollback_states,
@@ -981,7 +981,7 @@ def rollback_to_last_checkpoint(
 
     return ResetResult(
         status="applied",
-        migration_hash=prior.migration_hash,
+        evolution_hash=prior.evolution_hash,
         sources=[],
         rollbacks=rollbacks,
         rollback_event_id=event_id,

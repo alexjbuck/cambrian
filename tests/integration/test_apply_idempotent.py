@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from pyiceberg.catalog.rest import RestCatalog
 
-from cambrian.config import CambrianConfig, CatalogConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, EvolutionsConfig
 from cambrian.errors import UnsupportedStatementError
 from cambrian.migrate import apply_idempotent
 from cambrian.sidecar.events import latest_event
@@ -36,7 +36,7 @@ WAREHOUSE = "cambrian"
 
 def _build_config(
     *,
-    migrations_dir: Path,
+    evolutions_dir: Path,
     sidecar_namespace: str,
 ) -> CambrianConfig:
     """Construct a CambrianConfig pointing at the test rig.
@@ -57,17 +57,17 @@ def _build_config(
                 "s3.path-style-access": "true",
             },
         ),
-        migrations=MigrationsConfig(
-            dir=str(migrations_dir),
+        evolutions=EvolutionsConfig(
+            dir=str(evolutions_dir),
             sidecar_namespace=sidecar_namespace,
         ),
     )
 
 
-def _write_current(migrations_dir: Path, sql: str) -> Path:
-    """Write a ``current.sql`` into *migrations_dir* and return the path."""
-    migrations_dir.mkdir(parents=True, exist_ok=True)
-    p = migrations_dir / "current.sql"
+def _write_current(evolutions_dir: Path, sql: str) -> Path:
+    """Write a ``current.sql`` into *evolutions_dir* and return the path."""
+    evolutions_dir.mkdir(parents=True, exist_ok=True)
+    p = evolutions_dir / "current.sql"
     p.write_text(sql, encoding="utf-8")
     return p
 
@@ -102,9 +102,9 @@ def test_apply_creates_namespace_and_table(
         f"CREATE TABLE {ns}.t (id BIGINT, name STRING) USING iceberg;\n"
         f"INSERT INTO {ns}.t VALUES (1, 'alice'), (2, 'bob');\n"
     )
-    _write_current(tmp_path / "migrations", sql)
+    _write_current(tmp_path / "evolutions", sql)
     cfg = _build_config(
-        migrations_dir=tmp_path / "migrations",
+        evolutions_dir=tmp_path / "evolutions",
         sidecar_namespace=sidecar_ns,
     )
 
@@ -143,19 +143,19 @@ def test_apply_edit_reapplies(
 ) -> None:
     """Apply, edit current.sql (add ALTER), re-apply: new column exists."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
+    evolutions = tmp_path / "evolutions"
     _write_current(
-        migrations,
+        evolutions,
         f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     result1 = apply_idempotent(cfg)
     assert result1.status == "applied"
 
     # Edit: add an ALTER. Even without IF NOT EXISTS, the runner is
     # idempotent — but a fresh column on the next pass should land.
     _write_current(
-        migrations,
+        evolutions,
         (
             f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\n"
             f"ALTER TABLE {ns}.t ADD COLUMN added STRING;\n"
@@ -188,15 +188,15 @@ def test_apply_multi_column_alter_splits(
 ) -> None:
     """``ADD COLUMNS (a, b, c)`` produces three sequential metadata commits."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
+    evolutions = tmp_path / "evolutions"
     _write_current(
-        migrations,
+        evolutions,
         (
             f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\n"
             f"ALTER TABLE {ns}.t ADD COLUMNS (a INT, b INT, c INT);\n"
         ),
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     result = apply_idempotent(cfg)
     assert result.status == "applied"
 
@@ -227,9 +227,9 @@ def test_apply_multi_column_alter_splits(
 def test_apply_include(rest_catalog: RestCatalog, ns: str, tmp_path: Path, sidecar_ns: str) -> None:
     """``--! include current/*.sql`` pulls in glob-sorted child files."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    migrations.mkdir(parents=True)
-    children = migrations / "current"
+    evolutions = tmp_path / "evolutions"
+    evolutions.mkdir(parents=True)
+    children = evolutions / "current"
     children.mkdir()
     (children / "10_create.sql").write_text(
         f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\n",
@@ -239,11 +239,11 @@ def test_apply_include(rest_catalog: RestCatalog, ns: str, tmp_path: Path, sidec
         f"INSERT INTO {ns}.t VALUES (42);\n",
         encoding="utf-8",
     )
-    (migrations / "current.sql").write_text(
+    (evolutions / "current.sql").write_text(
         "--! include current/*.sql\n",
         encoding="utf-8",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     result = apply_idempotent(cfg)
     assert result.status == "applied", result
 
@@ -272,17 +272,17 @@ def test_apply_unsupported_statement_errors(
 ) -> None:
     """``INSERT ... SELECT`` raises UnsupportedStatementError under default mode."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
+    evolutions = tmp_path / "evolutions"
     # Need a real source table; we don't actually run the SELECT, just the
     # parser/dispatch path.
     _write_current(
-        migrations,
+        evolutions,
         (
             f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\n"
             f"INSERT INTO {ns}.t SELECT * FROM {ns}.other;\n"
         ),
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     with pytest.raises(UnsupportedStatementError):
         apply_idempotent(cfg)
 
@@ -292,12 +292,12 @@ def test_apply_idempotent_redo(
 ) -> None:
     """Applying ``CREATE TABLE IF NOT EXISTS`` twice: second is no-op via hash."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
+    evolutions = tmp_path / "evolutions"
     _write_current(
-        migrations,
+        evolutions,
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     result1 = apply_idempotent(cfg)
     assert result1.status == "applied"
     result2 = apply_idempotent(cfg)
@@ -309,9 +309,9 @@ def test_apply_emits_event_with_table_states(
 ) -> None:
     """A successful apply writes an event with the new hash + table_states rows."""
     sql = f"CREATE TABLE {ns}.t (id BIGINT) USING iceberg;\nINSERT INTO {ns}.t VALUES (1);\n"
-    _write_current(tmp_path / "migrations", sql)
+    _write_current(tmp_path / "evolutions", sql)
     cfg = _build_config(
-        migrations_dir=tmp_path / "migrations",
+        evolutions_dir=tmp_path / "evolutions",
         sidecar_namespace=sidecar_ns,
     )
     result = apply_idempotent(cfg)
@@ -319,8 +319,8 @@ def test_apply_emits_event_with_table_states(
     assert result.event_id is not None
 
     # Look up the event we just emitted.
-    event = latest_event(rest_catalog, sidecar_ns, event_type="apply", migration_id="current")
+    event = latest_event(rest_catalog, sidecar_ns, event_type="apply", evolution_id="current")
     assert event is not None
     assert event.event_id == result.event_id
-    assert event.migration_hash == result.migration_hash
-    assert event.migration_sql == sql
+    assert event.evolution_hash == result.evolution_hash
+    assert event.evolution_sql == sql

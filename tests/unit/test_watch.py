@@ -15,7 +15,7 @@ import pytest
 from watchfiles import Change
 
 import cambrian.migrate.watch as watch_mod
-from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, EvolutionsConfig
 from cambrian.errors import CambrianError
 from cambrian.migrate.runner import ApplyResult
 
@@ -23,7 +23,7 @@ from cambrian.migrate.runner import ApplyResult
 def _make_config(tmp_path: Path, *, debounce_ms: int = 50) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(type="sql", uri="sqlite:///:memory:"),
-        migrations=MigrationsConfig(dir=str(tmp_path / "migrations")),
+        evolutions=EvolutionsConfig(dir=str(tmp_path / "evolutions")),
         dev=DevConfig(debounce_ms=debounce_ms),
     )
 
@@ -59,7 +59,7 @@ def _stub_apply_factory(call_log: list[CambrianConfig]) -> object:
         call_log.append(config)
         return ApplyResult(
             status="applied",
-            migration_hash="deadbeef" + "0" * 56,
+            evolution_hash="deadbeef" + "0" * 56,
             sources=[],
             statements=[],
             event_id="evt-" + str(len(call_log)),
@@ -76,8 +76,8 @@ def test_watch_calls_apply_once_per_batch(tmp_path: Path, monkeypatch: pytest.Mo
 
     fake = _FakeWatcher(
         [
-            {(Change.modified, str(tmp_path / "migrations" / "current.sql"))},
-            {(Change.modified, str(tmp_path / "migrations" / "current.sql"))},
+            {(Change.modified, str(tmp_path / "evolutions" / "current.sql"))},
+            {(Change.modified, str(tmp_path / "evolutions" / "current.sql"))},
         ]
     )
 
@@ -132,7 +132,7 @@ def test_watch_parse_error_keeps_loop_alive(
             raise CambrianError("synthetic parse failure")
         return ApplyResult(
             status="applied",
-            migration_hash="cafe" + "0" * 60,
+            evolution_hash="cafe" + "0" * 60,
             sources=[],
         )
 
@@ -190,7 +190,7 @@ def test_watch_use_reset_routes_to_apply_reset(
     ) -> ApplyResult:
         del config, allow_partial, actor
         routed_to.append("idempotent")
-        return ApplyResult(status="applied", migration_hash="i" * 64)
+        return ApplyResult(status="applied", evolution_hash="i" * 64)
 
     def _reset(
         config: CambrianConfig,
@@ -201,7 +201,7 @@ def test_watch_use_reset_routes_to_apply_reset(
     ) -> ResetResult:
         del config, allow_partial, force, actor
         routed_to.append("reset")
-        return ResetResult(status="applied", migration_hash="r" * 64)
+        return ResetResult(status="applied", evolution_hash="r" * 64)
 
     monkeypatch.setattr(watch_mod, "apply_idempotent", _idem)
     monkeypatch.setattr(runner, "apply_reset", _reset)
@@ -218,19 +218,19 @@ def test_watch_use_reset_routes_to_apply_reset(
 
 def test_watch_resolves_targets_from_includes(tmp_path: Path) -> None:
     """``_resolve_watch_targets`` returns the directories of every included file."""
-    migrations = tmp_path / "migrations"
-    nested = migrations / "current"
+    evolutions = tmp_path / "evolutions"
+    nested = evolutions / "current"
     nested.mkdir(parents=True)
     (nested / "a.sql").write_text("CREATE NAMESPACE x;\n", encoding="utf-8")
     (nested / "b.sql").write_text("CREATE NAMESPACE y;\n", encoding="utf-8")
-    (migrations / "current.sql").write_text("--! include current/*.sql\n", encoding="utf-8")
+    (evolutions / "current.sql").write_text("--! include current/*.sql\n", encoding="utf-8")
 
     cfg = _make_config(tmp_path)
     targets = watch_mod._resolve_watch_targets(cfg)  # type: ignore[attr-defined]
-    # Both the root migrations dir (for current.sql) and the current/ dir
+    # Both the root evolutions dir (for current.sql) and the current/ dir
     # (for the includes) end up in the set.
     resolved = {p.resolve() for p in targets}
-    assert migrations.resolve() in resolved
+    assert evolutions.resolve() in resolved
     assert nested.resolve() in resolved
 
 
@@ -238,4 +238,4 @@ def test_watch_resolves_falls_back_when_no_current_sql(tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     # No current.sql exists.
     targets = watch_mod._resolve_watch_targets(cfg)  # type: ignore[attr-defined]
-    assert targets == [(tmp_path / "migrations").resolve()]
+    assert targets == [(tmp_path / "evolutions").resolve()]

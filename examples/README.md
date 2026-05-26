@@ -5,6 +5,12 @@ Iceberg stack (Lakekeeper + rustfs + postgres in Docker). Skim the
 top-level [README](../README.md) for orientation first; this doc is the
 hands-on follow-up.
 
+Cambrian calls the units it manages **evolutions** — matching Iceberg's
+own "schema evolution" / "partition evolution" vocabulary. (If you've
+used Postgres tools like Flyway or graphile-migrate, this is the same
+workflow: file history in git, bootstrap new instances by re-applying
+the same set.)
+
 ## What you'll learn
 
 The cambrian lifecycle has four moving parts: **idempotent apply** of
@@ -14,7 +20,7 @@ freeze a dev iteration into the canonical `committed/` history, and
 this walkthrough you'll have done each one against a real catalog.
 
 The load-bearing principle: **idempotent is the path; reset is the
-relief valve.** Every migration here is written so it can be re-run any
+relief valve.** Every evolution here is written so it can be re-run any
 number of times with the same end state. We touch reset only as a
 postscript.
 
@@ -110,9 +116,9 @@ cambrian init --path cambrian.toml
 Already initialized: sidecar at _cambrian (version=1)
 ```
 
-## Step 3: Your first migration
+## Step 3: Your first evolution
 
-`current.sql` is your in-flight migration. The starting copy is:
+`current.sql` is your in-flight evolution. The starting copy is:
 
 ```sql
 CREATE NAMESPACE IF NOT EXISTS demo;
@@ -134,8 +140,8 @@ cambrian apply --json --path cambrian.toml
 {
   "mode": "idempotent",
   "status": "applied",
-  "migration_id": "current",
-  "migration_hash": "2a07e5709c45…",
+  "evolution_id": "current",
+  "evolution_hash": "2a07e5709c45…",
   "statements": [
     { "notes": "created namespace demo", ... },
     { "notes": "created table demo.users", "affected_tables": ["demo.users"], ... }
@@ -222,9 +228,9 @@ cambrian commit -m "users table v1" --json --path cambrian.toml
 ```json
 # expected:
 {
-  "migration_id": "0001_users-table-v1",
+  "evolution_id": "0001_users-table-v1",
   "committed_path": ".../examples/committed/0001_users-table-v1.sql",
-  "migration_hash": "b047b2d8bda5…",
+  "evolution_hash": "b047b2d8bda5…",
   "tag_ref": "cambrian.committed.1.users-table-v1",
   "event_id": "...",
   "affected_tables": ["demo.users"]
@@ -257,9 +263,9 @@ cambrian status --json --path cambrian.toml
   "sidecar_namespace": "_cambrian",
   "sidecar_version": 1,
   "committed_count": 1,
-  "committed_migrations": [
+  "committed_evolutions": [
     {
-      "migration_id": "0001_users-table-v1",
+      "evolution_id": "0001_users-table-v1",
       "event_id": "...",
       "event_ts": "..."
     }
@@ -293,7 +299,7 @@ cambrian sync --json --path cambrian.toml
   "skipped": 0,
   "refused": 0,
   "files": [
-    { "migration_id": "0001_users-table-v1", "status": "written", ... }
+    { "evolution_id": "0001_users-table-v1", "status": "written", ... }
   ]
 }
 ```
@@ -313,7 +319,7 @@ cambrian sync --json --path cambrian.toml
 ```
 
 In a real deploy, CI runs `cambrian sync` (to rehydrate), then
-`cambrian apply` — which replays any committed migrations the catalog
+`cambrian apply` — which replays any committed evolutions the catalog
 hasn't yet recorded, then re-checks `current.sql`. Same binary, same
 flags, idempotent end state.
 
@@ -325,7 +331,7 @@ cd ..
 
 ## Bonus: reset is the relief valve
 
-Some migrations genuinely cannot be expressed idempotently — a column
+Some evolutions genuinely cannot be expressed idempotently — a column
 type change with data loss, a rebuild of a partitioned table, etc.
 That's what `cambrian apply --reset` is for: it captures (or reuses) a
 checkpoint of every affected table, rolls the tables back to it, and

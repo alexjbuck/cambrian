@@ -9,7 +9,7 @@ import pytest
 from cambrian.config import (
     CambrianConfig,
     DevConfig,
-    MigrationsConfig,
+    EvolutionsConfig,
     load_config,
     redacted_dump,
 )
@@ -40,8 +40,8 @@ type = "rest"
 uri = "http://localhost:8181"
 warehouse = "s3://bucket/"
 
-[migrations]
-dir = "./my-migs"
+[evolutions]
+dir = "./my-evos"
 sidecar_namespace = "_my_ns"
 
 [dev]
@@ -54,15 +54,15 @@ debounce_ms = 1000
     assert isinstance(cfg, CambrianConfig)
     assert cfg.catalog.type == "rest"
     assert cfg.catalog.uri == "http://localhost:8181"
-    assert cfg.migrations.dir == "./my-migs"
-    assert cfg.migrations.sidecar_namespace == "_my_ns"
+    assert cfg.evolutions.dir == "./my-evos"
+    assert cfg.evolutions.sidecar_namespace == "_my_ns"
     assert cfg.dev.mode == "reset"
     assert cfg.dev.watch is False
     assert cfg.dev.debounce_ms == 1000
 
 
 def test_load_minimal_config_uses_defaults(tmp_path: Path) -> None:
-    """Only [catalog] required; [migrations] and [dev] take defaults."""
+    """Only [catalog] required; [evolutions] and [dev] take defaults."""
     path = _write(
         tmp_path,
         """
@@ -72,11 +72,11 @@ uri = "http://localhost:8181"
 """,
     )
     cfg = load_config(path)
-    # Migrations defaults
-    assert cfg.migrations == MigrationsConfig()
-    assert cfg.migrations.dir == "./migrations"
-    assert cfg.migrations.sidecar_namespace == "_cambrian"
-    assert cfg.migrations.sidecar_catalog is None
+    # Evolutions defaults
+    assert cfg.evolutions == EvolutionsConfig()
+    assert cfg.evolutions.dir == "./evolutions"
+    assert cfg.evolutions.sidecar_namespace == "_cambrian"
+    assert cfg.evolutions.sidecar_catalog is None
     # Dev defaults
     assert cfg.dev == DevConfig()
     assert cfg.dev.mode == "idempotent"
@@ -84,8 +84,8 @@ uri = "http://localhost:8181"
     assert cfg.dev.debounce_ms == 500
 
 
-def test_migrations_partial_overrides(tmp_path: Path) -> None:
-    """Only some [migrations] fields supplied; the rest fall back to defaults."""
+def test_evolutions_partial_overrides(tmp_path: Path) -> None:
+    """Only some [evolutions] fields supplied; the rest fall back to defaults."""
     path = _write(
         tmp_path,
         """
@@ -93,14 +93,14 @@ def test_migrations_partial_overrides(tmp_path: Path) -> None:
 type = "rest"
 uri = "http://localhost:8181"
 
-[migrations]
+[evolutions]
 dir = "./scripts"
 """,
     )
     cfg = load_config(path)
-    assert cfg.migrations.dir == "./scripts"
+    assert cfg.evolutions.dir == "./scripts"
     # Defaults preserved
-    assert cfg.migrations.sidecar_namespace == "_cambrian"
+    assert cfg.evolutions.sidecar_namespace == "_cambrian"
 
 
 def test_sidecar_table_removed_from_schema(tmp_path: Path) -> None:
@@ -112,8 +112,8 @@ def test_sidecar_table_removed_from_schema(tmp_path: Path) -> None:
 type = "rest"
 uri = "http://localhost:8181"
 
-[migrations]
-sidecar_table = "migration_state"
+[evolutions]
+sidecar_table = "evolution_state"
 """,
     )
     with pytest.raises(InvalidConfigError) as excinfo:
@@ -135,8 +135,8 @@ def test_missing_catalog_table_raises(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         """
-[migrations]
-dir = "./m"
+[evolutions]
+dir = "./e"
 """,
     )
     with pytest.raises(InvalidConfigError) as excinfo:
@@ -176,7 +176,7 @@ uri = "http://localhost:8181"
 
 
 def test_unknown_top_level_table_raises(tmp_path: Path) -> None:
-    """Typo `[migration]` (singular) should be rejected with a helpful list."""
+    """Typo `[evolution]` (singular) should be rejected with a helpful list."""
     path = _write(
         tmp_path,
         """
@@ -184,16 +184,16 @@ def test_unknown_top_level_table_raises(tmp_path: Path) -> None:
 type = "rest"
 uri = "http://localhost:8181"
 
-[migration]
-dir = "./m"
+[evolution]
+dir = "./e"
 """,
     )
     with pytest.raises(InvalidConfigError) as excinfo:
         load_config(path)
     message = str(excinfo.value)
-    assert "migration" in message
+    assert "evolution" in message
     # Valid top-level table names are listed in the error.
-    for name in ("catalog", "migrations", "dev"):
+    for name in ("catalog", "evolutions", "dev"):
         assert name in message
 
 
@@ -324,7 +324,7 @@ def test_env_interpolation_only_strings(tmp_path: Path, monkeypatch: pytest.Monk
 type = "rest"
 uri = "http://localhost:8181"
 
-[migrations]
+[evolutions]
 dir = "${CAMBRIAN_DIR}"
 
 [dev]
@@ -333,7 +333,7 @@ watch = false
 """,
     )
     cfg = load_config(path)
-    assert cfg.migrations.dir == "./from-env-dir"
+    assert cfg.evolutions.dir == "./from-env-dir"
     assert cfg.dev.debounce_ms == 250
     assert cfg.dev.watch is False
 
@@ -432,7 +432,7 @@ type = "rest"
 uri = "http://localhost:8181"
 token = "outer-secret"
 
-[migrations.sidecar_catalog]
+[evolutions.sidecar_catalog]
 type = "rest"
 uri = "http://sidecar:8181"
 token = "nested-secret"
@@ -441,6 +441,6 @@ token = "nested-secret"
     cfg = load_config(path)
     dumped = redacted_dump(cfg)
     assert dumped["catalog"]["token"] == "***"
-    assert dumped["migrations"]["sidecar_catalog"]["token"] == "***"
+    assert dumped["evolutions"]["sidecar_catalog"]["token"] == "***"
     # Non-credential fields preserved at the nested level too.
-    assert dumped["migrations"]["sidecar_catalog"]["uri"] == "http://sidecar:8181"
+    assert dumped["evolutions"]["sidecar_catalog"]["uri"] == "http://sidecar:8181"

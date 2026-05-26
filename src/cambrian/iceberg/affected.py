@@ -55,8 +55,8 @@ class TableIdent:
 
     ``namespace`` may be ``None`` for unqualified references — dispatch
     is then expected to resolve against the current catalog default
-    (which cambrian doesn't track explicitly; an unqualified table in a
-    migration is almost certainly a bug, so dispatch should fail loud).
+    (which cambrian doesn't track explicitly; an unqualified table in an
+    evolution is almost certainly a bug, so dispatch should fail loud).
     """
 
     namespace: str | None

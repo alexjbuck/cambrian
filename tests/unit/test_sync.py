@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pyarrow as pa
 import pytest
 
-from cambrian.config import CambrianConfig, CatalogConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, EvolutionsConfig
 from cambrian.errors import IllegalStateError
 from cambrian.migrate.sync import (
     SyncResult,
@@ -36,9 +36,9 @@ def _ts(offset: int) -> datetime:
 def _event_row(
     *,
     event_type: str,
-    migration_id: str,
-    migration_sql: str = "",
-    migration_hash: str | None = None,
+    evolution_id: str,
+    evolution_sql: str = "",
+    evolution_hash: str | None = None,
     ts: datetime | None = None,
     event_id: str | None = None,
 ) -> dict[str, Any]:
@@ -46,9 +46,9 @@ def _event_row(
         "event_id": event_id or str(uuid.uuid4()),
         "event_ts": ts or _ts(0),
         "event_type": event_type,
-        "migration_id": migration_id,
-        "migration_hash": migration_hash if migration_hash is not None else _sha(migration_sql),
-        "migration_sql": migration_sql,
+        "evolution_id": evolution_id,
+        "evolution_hash": evolution_hash if evolution_hash is not None else _sha(evolution_sql),
+        "evolution_sql": evolution_sql,
         "actor": "test",
         "notes": None,
     }
@@ -61,9 +61,9 @@ def _events_arrow(rows: list[dict[str, Any]]) -> pa.Table:
                 "event_id": pa.array([], pa.string()),
                 "event_ts": pa.array([], pa.timestamp("us", tz="UTC")),
                 "event_type": pa.array([], pa.string()),
-                "migration_id": pa.array([], pa.string()),
-                "migration_hash": pa.array([], pa.string()),
-                "migration_sql": pa.array([], pa.string()),
+                "evolution_id": pa.array([], pa.string()),
+                "evolution_hash": pa.array([], pa.string()),
+                "evolution_sql": pa.array([], pa.string()),
                 "actor": pa.array([], pa.string()),
                 "notes": pa.array([], pa.string()),
             }
@@ -73,9 +73,9 @@ def _events_arrow(rows: list[dict[str, Any]]) -> pa.Table:
             "event_id": [r["event_id"] for r in rows],
             "event_ts": [r["event_ts"] for r in rows],
             "event_type": [r["event_type"] for r in rows],
-            "migration_id": [r["migration_id"] for r in rows],
-            "migration_hash": [r["migration_hash"] for r in rows],
-            "migration_sql": [r["migration_sql"] for r in rows],
+            "evolution_id": [r["evolution_id"] for r in rows],
+            "evolution_hash": [r["evolution_hash"] for r in rows],
+            "evolution_sql": [r["evolution_sql"] for r in rows],
             "actor": [r["actor"] for r in rows],
             "notes": [r["notes"] for r in rows],
         }
@@ -123,7 +123,7 @@ def stub_catalog_and_selfmigrate(
 def _config(tmp_path: Path) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(type="sql", uri=f"sqlite:///{tmp_path}/cat.db"),
-        migrations=MigrationsConfig(dir=str(tmp_path / "migrations")),
+        evolutions=EvolutionsConfig(dir=str(tmp_path / "evolutions")),
     )
 
 
@@ -133,12 +133,12 @@ def test_sync_writes_missing_files(
 ) -> None:
     sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     stub_catalog_and_selfmigrate.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(1))
     )
 
     result = cambrian_sync(_config(tmp_path))
 
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     assert target.exists()
     assert target.read_text(encoding="utf-8") == sql
     assert result.written == 1
@@ -151,12 +151,12 @@ def test_sync_skips_hash_matched_files(
     stub_catalog_and_selfmigrate: list[dict[str, Any]],
 ) -> None:
     sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     target.parent.mkdir(parents=True)
     target.write_text(sql, encoding="utf-8")
 
     stub_catalog_and_selfmigrate.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(1))
     )
 
     result = cambrian_sync(_config(tmp_path))
@@ -172,13 +172,13 @@ def test_sync_refuses_conflict_without_force(
 ) -> None:
     catalog_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     local_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT, extra STRING);\n"
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     target.parent.mkdir(parents=True)
     target.write_text(local_sql, encoding="utf-8")
 
     stub_catalog_and_selfmigrate.append(
         _event_row(
-            event_type="commit", migration_id="0001_seed", migration_sql=catalog_sql, ts=_ts(1)
+            event_type="commit", evolution_id="0001_seed", evolution_sql=catalog_sql, ts=_ts(1)
         )
     )
 
@@ -195,13 +195,13 @@ def test_sync_force_overwrites_conflict(
 ) -> None:
     catalog_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     local_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT, extra STRING);\n"
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     target.parent.mkdir(parents=True)
     target.write_text(local_sql, encoding="utf-8")
 
     stub_catalog_and_selfmigrate.append(
         _event_row(
-            event_type="commit", migration_id="0001_seed", migration_sql=catalog_sql, ts=_ts(1)
+            event_type="commit", evolution_id="0001_seed", evolution_sql=catalog_sql, ts=_ts(1)
         )
     )
 
@@ -218,12 +218,12 @@ def test_sync_dry_run_writes_nothing(
 ) -> None:
     sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     stub_catalog_and_selfmigrate.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(1))
     )
 
     result = cambrian_sync(_config(tmp_path), dry_run=True)
 
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     assert not target.exists()
     assert result.dry_run is True
     assert result.written == 1
@@ -236,13 +236,13 @@ def test_sync_diff_implies_dry_run_without_force(
 ) -> None:
     catalog_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     local_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT, evil STRING);\n"
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     target.parent.mkdir(parents=True)
     target.write_text(local_sql, encoding="utf-8")
 
     stub_catalog_and_selfmigrate.append(
         _event_row(
-            event_type="commit", migration_id="0001_seed", migration_sql=catalog_sql, ts=_ts(1)
+            event_type="commit", evolution_id="0001_seed", evolution_sql=catalog_sql, ts=_ts(1)
         )
     )
 
@@ -263,13 +263,13 @@ def test_sync_diff_with_force_still_overwrites(
 ) -> None:
     catalog_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     local_sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT, evil STRING);\n"
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     target.parent.mkdir(parents=True)
     target.write_text(local_sql, encoding="utf-8")
 
     stub_catalog_and_selfmigrate.append(
         _event_row(
-            event_type="commit", migration_id="0001_seed", migration_sql=catalog_sql, ts=_ts(1)
+            event_type="commit", evolution_id="0001_seed", evolution_sql=catalog_sql, ts=_ts(1)
         )
     )
 
@@ -288,15 +288,15 @@ def test_sync_filters_out_uncommitted(
     sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     rows = stub_catalog_and_selfmigrate
     rows.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(1))
     )
     rows.append(
-        _event_row(event_type="uncommit", migration_id="0001_seed", migration_sql=sql, ts=_ts(2))
+        _event_row(event_type="uncommit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(2))
     )
 
     result = cambrian_sync(_config(tmp_path))
 
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     assert not target.exists()
     assert result.files == []
 
@@ -310,18 +310,18 @@ def test_sync_re_committed_after_uncommit_is_synced(
     sql_v2 = "CREATE TABLE IF NOT EXISTS t (id BIGINT, name STRING);\n"
     rows = stub_catalog_and_selfmigrate
     rows.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql_v1, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql_v1, ts=_ts(1))
     )
     rows.append(
-        _event_row(event_type="uncommit", migration_id="0001_seed", migration_sql=sql_v1, ts=_ts(2))
+        _event_row(event_type="uncommit", evolution_id="0001_seed", evolution_sql=sql_v1, ts=_ts(2))
     )
     rows.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql_v2, ts=_ts(3))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql_v2, ts=_ts(3))
     )
 
     result = cambrian_sync(_config(tmp_path))
 
-    target = tmp_path / "migrations" / "committed" / "0001_seed.sql"
+    target = tmp_path / "evolutions" / "committed" / "0001_seed.sql"
     assert target.exists()
     assert target.read_text(encoding="utf-8") == sql_v2
     assert result.written == 1
@@ -335,9 +335,9 @@ def test_sync_refuses_internally_inconsistent_catalog_row(
     stub_catalog_and_selfmigrate.append(
         _event_row(
             event_type="commit",
-            migration_id="0001_seed",
-            migration_sql=sql,
-            migration_hash="deadbeef" * 8,  # 64 hex chars, but not sha256(sql)
+            evolution_id="0001_seed",
+            evolution_sql=sql,
+            evolution_hash="deadbeef" * 8,  # 64 hex chars, but not sha256(sql)
             ts=_ts(1),
         )
     )
@@ -353,7 +353,7 @@ def test_sync_writes_no_events(
     """sync is read-only against the catalog. No write_event must fire."""
     sql = "CREATE TABLE IF NOT EXISTS t (id BIGINT);\n"
     stub_catalog_and_selfmigrate.append(
-        _event_row(event_type="commit", migration_id="0001_seed", migration_sql=sql, ts=_ts(1))
+        _event_row(event_type="commit", evolution_id="0001_seed", evolution_sql=sql, ts=_ts(1))
     )
 
     with patch("cambrian.sidecar.events.write_event") as mock_write:
@@ -369,19 +369,19 @@ def test_sync_result_summary_counts(tmp_path: Path) -> None:
     sr = SyncResult(
         files=[
             SyncFileResult(
-                migration_id="a", path=tmp_path / "a.sql", status="written", catalog_hash="x"
+                evolution_id="a", path=tmp_path / "a.sql", status="written", catalog_hash="x"
             ),
             SyncFileResult(
-                migration_id="b", path=tmp_path / "b.sql", status="written", catalog_hash="x"
+                evolution_id="b", path=tmp_path / "b.sql", status="written", catalog_hash="x"
             ),
             SyncFileResult(
-                migration_id="c", path=tmp_path / "c.sql", status="skipped", catalog_hash="x"
+                evolution_id="c", path=tmp_path / "c.sql", status="skipped", catalog_hash="x"
             ),
             SyncFileResult(
-                migration_id="d", path=tmp_path / "d.sql", status="overwritten", catalog_hash="x"
+                evolution_id="d", path=tmp_path / "d.sql", status="overwritten", catalog_hash="x"
             ),
             SyncFileResult(
-                migration_id="e", path=tmp_path / "e.sql", status="refused", catalog_hash="x"
+                evolution_id="e", path=tmp_path / "e.sql", status="refused", catalog_hash="x"
             ),
         ]
     )

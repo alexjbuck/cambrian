@@ -2,7 +2,7 @@
 
 The catalog is the source of truth for what was committed and applied to
 production. A fresh checkout, or a teammate onboarding to an established
-project, runs ``cambrian sync`` to mirror the live committed-migration set
+project, runs ``cambrian sync`` to mirror the live committed-evolution set
 into their local ``committed/`` directory.
 
 Design notes:
@@ -11,7 +11,7 @@ Design notes:
   Sync rehydrates local files from existing catalog state; the catalog
   state itself is unchanged, so the audit trail has nothing new to record.
   An alternative would emit a synthetic ``sync`` event for audit ("who
-  pulled which migrations to disk, when") but that conflates filesystem
+  pulled which evolutions to disk, when") but that conflates filesystem
   bookkeeping with catalog state. The locked sidecar event types
   (``apply``/``rollback``/``commit``/``uncommit``/``checkpoint``) all
   record *catalog* mutations; ``sync`` doesn't fit.
@@ -22,7 +22,7 @@ Design notes:
   refused unless ``--force``; ``--diff`` surfaces the unified diff.
 
 * **Internal-consistency guard**: every commit row must satisfy
-  ``sha256(migration_sql) == migration_hash``. A mismatch means the
+  ``sha256(evolution_sql) == evolution_hash``. A mismatch means the
   catalog row is malformed; we refuse so the user investigates instead
   of overwriting good local files with bad catalog data.
 
@@ -59,9 +59,9 @@ SyncStatus = Literal["written", "overwritten", "skipped", "refused", "discrepanc
 
 @dataclass
 class SyncFileResult:
-    """One committed migration's outcome during a sync."""
+    """One committed evolution's outcome during a sync."""
 
-    migration_id: str
+    evolution_id: str
     path: Path
     status: SyncStatus
     catalog_hash: str
@@ -127,7 +127,7 @@ def cambrian_sync(
 
     Raises:
         IllegalStateError: a catalog row is internally inconsistent
-            (recorded ``migration_hash`` != sha256(``migration_sql``)).
+            (recorded ``evolution_hash`` != sha256(``evolution_sql``)).
     """
     del actor  # explicit no-op; see module docstring
 
@@ -136,14 +136,14 @@ def cambrian_sync(
     catalog = load_catalog(config)
     state = ensure_current(
         catalog,
-        config.migrations.sidecar_namespace,
+        config.evolutions.sidecar_namespace,
         allow_read_only=True,
     )
     namespace = state.sidecar_namespace
 
     payloads = committed_payloads(catalog, namespace)
-    migrations_dir = Path(config.migrations.dir).resolve()
-    committed_dir = migrations_dir / "committed"
+    evolutions_dir = Path(config.evolutions.dir).resolve()
+    committed_dir = evolutions_dir / "committed"
 
     result = SyncResult(dry_run=effective_dry_run)
 
@@ -163,18 +163,18 @@ def cambrian_sync(
 
 
 def _verify_catalog_consistency(payload: CommittedPayload) -> None:
-    """Fail loudly if ``sha256(migration_sql) != migration_hash``.
+    """Fail loudly if ``sha256(evolution_sql) != evolution_hash``.
 
     Defensive guard against a malformed events row. If this trips the
     catalog itself is the problem — refuse and let the user investigate
     rather than overwriting a good local file with corrupt data.
     """
-    computed = hashlib.sha256(payload.migration_sql.encode("utf-8")).hexdigest()
-    if computed != payload.migration_hash:
+    computed = hashlib.sha256(payload.evolution_sql.encode("utf-8")).hexdigest()
+    if computed != payload.evolution_hash:
         raise IllegalStateError(
-            f"catalog row for {payload.migration_id} is internally inconsistent: "
-            f"recorded hash {payload.migration_hash[:12]}… does not match "
-            f"sha256(migration_sql) = {computed[:12]}…. The events table appears "
+            f"catalog row for {payload.evolution_id} is internally inconsistent: "
+            f"recorded hash {payload.evolution_hash[:12]}… does not match "
+            f"sha256(evolution_sql) = {computed[:12]}…. The events table appears "
             "corrupt; sync refuses to write potentially-bad SQL to disk. "
             "Investigate the sidecar (event_id "
             f"{payload.event_id}) before retrying."
@@ -189,73 +189,73 @@ def _sync_one(
     dry_run: bool,
     include_diff: bool,
 ) -> SyncFileResult:
-    target = committed_dir / f"{payload.migration_id}.sql"
+    target = committed_dir / f"{payload.evolution_id}.sql"
 
     if not target.exists():
         if not dry_run:
             committed_dir.mkdir(parents=True, exist_ok=True)
-            target.write_text(payload.migration_sql, encoding="utf-8")
+            target.write_text(payload.evolution_sql, encoding="utf-8")
         return SyncFileResult(
-            migration_id=payload.migration_id,
+            evolution_id=payload.evolution_id,
             path=target,
             status="written",
-            catalog_hash=payload.migration_hash,
+            catalog_hash=payload.evolution_hash,
             note="would write" if dry_run else None,
         )
 
     local_text = target.read_text(encoding="utf-8")
     local_hash = hashlib.sha256(local_text.encode("utf-8")).hexdigest()
 
-    if local_hash == payload.migration_hash:
+    if local_hash == payload.evolution_hash:
         return SyncFileResult(
-            migration_id=payload.migration_id,
+            evolution_id=payload.evolution_id,
             path=target,
             status="skipped",
-            catalog_hash=payload.migration_hash,
+            catalog_hash=payload.evolution_hash,
             local_hash=local_hash,
         )
 
     diff_text = (
-        _unified_diff(local_text, payload.migration_sql, payload.migration_id)
+        _unified_diff(local_text, payload.evolution_sql, payload.evolution_id)
         if include_diff
         else None
     )
 
     if force:
         if not dry_run:
-            target.write_text(payload.migration_sql, encoding="utf-8")
+            target.write_text(payload.evolution_sql, encoding="utf-8")
         return SyncFileResult(
-            migration_id=payload.migration_id,
+            evolution_id=payload.evolution_id,
             path=target,
             status="overwritten",
-            catalog_hash=payload.migration_hash,
+            catalog_hash=payload.evolution_hash,
             local_hash=local_hash,
             diff=diff_text,
             note="would overwrite" if dry_run else None,
         )
 
     return SyncFileResult(
-        migration_id=payload.migration_id,
+        evolution_id=payload.evolution_id,
         path=target,
         status="refused",
-        catalog_hash=payload.migration_hash,
+        catalog_hash=payload.evolution_hash,
         local_hash=local_hash,
         diff=diff_text,
         note=(
             f"local file differs from catalog (local hash {local_hash[:12]}…, "
-            f"catalog hash {payload.migration_hash[:12]}…); re-run with --force "
+            f"catalog hash {payload.evolution_hash[:12]}…); re-run with --force "
             "to overwrite or --diff to inspect."
         ),
     )
 
 
-def _unified_diff(local_text: str, catalog_text: str, migration_id: str) -> str:
+def _unified_diff(local_text: str, catalog_text: str, evolution_id: str) -> str:
     return "".join(
         difflib.unified_diff(
             local_text.splitlines(keepends=True),
             catalog_text.splitlines(keepends=True),
-            fromfile=f"local/{migration_id}.sql",
-            tofile=f"catalog/{migration_id}.sql",
+            fromfile=f"local/{evolution_id}.sql",
+            tofile=f"catalog/{evolution_id}.sql",
             lineterm="",
         )
     )

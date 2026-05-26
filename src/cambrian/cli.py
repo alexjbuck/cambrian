@@ -35,7 +35,7 @@ from cambrian.migrate.runner import (
 )
 from cambrian.migrate.sync import SyncResult, cambrian_sync
 from cambrian.migrate.watch import watch as _watch_loop
-from cambrian.sidecar.events import committed_migrations, latest_event
+from cambrian.sidecar.events import committed_evolutions, latest_event
 from cambrian.sidecar.schema import CAMBRIAN_SIDECAR_VERSION
 from cambrian.sidecar.selfmigrate import ensure_current
 
@@ -47,7 +47,7 @@ EXIT_EXTERNAL_WRITE = 4
 
 app = typer.Typer(
     name="cambrian",
-    help="SQL-driven migration runner for Apache Iceberg tables.",
+    help="SQL-driven evolution runner for Apache Iceberg tables.",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -71,7 +71,7 @@ def _root(
         ),
     ] = False,
 ) -> None:
-    """cambrian — SQL-driven migration runner for Apache Iceberg tables."""
+    """cambrian — SQL-driven evolution runner for Apache Iceberg tables."""
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def init_command(
     Fails if the sidecar is at a *newer* version than this binary knows.
     """
     cfg, catalog = _load(path)
-    namespace = cfg.migrations.sidecar_namespace
+    namespace = cfg.evolutions.sidecar_namespace
 
     from cambrian.sidecar.selfmigrate import _version_table_exists
 
@@ -219,9 +219,9 @@ def _status_payload(
         "sidecar_version": state.version,
         "is_version_ahead": state.is_version_ahead,
         "committed_count": len(committed),
-        "committed_migrations": [
+        "committed_evolutions": [
             {
-                "migration_id": c.migration_id,
+                "evolution_id": c.evolution_id,
                 "event_id": c.event_id,
                 "event_ts": c.event_ts.isoformat(),
             }
@@ -233,7 +233,7 @@ def _status_payload(
             else {
                 "event_id": current.event_id,
                 "event_ts": current.event_ts.isoformat(),
-                "migration_hash": current.migration_hash,
+                "evolution_hash": current.evolution_hash,
             }
         ),
     }
@@ -247,14 +247,14 @@ def status_command(
         typer.Option("--json", help="Emit machine-readable JSON instead of the human view."),
     ] = False,
 ) -> None:
-    """Report sidecar version, committed migrations, and the current in-flight apply.
+    """Report sidecar version, committed evolutions, and the current in-flight apply.
 
     Read-only: tolerates a sidecar that is one or more versions ahead of
     this binary (prints a warning). Exits ``2`` if the sidecar has never
     been initialised in this catalog.
     """
     cfg, catalog = _load(path)
-    namespace = cfg.migrations.sidecar_namespace
+    namespace = cfg.evolutions.sidecar_namespace
 
     try:
         state = ensure_current(catalog, namespace, allow_read_only=True)
@@ -277,8 +277,8 @@ def status_command(
             )
         raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
 
-    committed = committed_migrations(catalog, namespace)
-    current = latest_event(catalog, namespace, event_type="apply", migration_id="current")
+    committed = committed_evolutions(catalog, namespace)
+    current = latest_event(catalog, namespace, event_type="apply", evolution_id="current")
 
     if as_json:
         typer.echo(json.dumps(_status_payload(state, committed, current), indent=2))
@@ -293,15 +293,15 @@ def status_command(
 
     typer.echo(f"sidecar namespace: {state.sidecar_namespace}")
     typer.echo(f"sidecar version: {state.version}")
-    typer.echo(f"committed migrations: {len(committed)}")
+    typer.echo(f"committed evolutions: {len(committed)}")
     for c in committed:
-        typer.echo(f"  - {c.migration_id} (event {c.event_id} @ {c.event_ts.isoformat()})")
+        typer.echo(f"  - {c.evolution_id} (event {c.event_id} @ {c.event_ts.isoformat()})")
     if current is None:
         typer.echo("current applied: <none>")
     else:
         typer.echo(
             f"current applied: event {current.event_id} @ {current.event_ts.isoformat()} "
-            f"(hash {current.migration_hash[:12]}…)"
+            f"(hash {current.evolution_hash[:12]}…)"
         )
 
 
@@ -329,7 +329,7 @@ def apply_command(
             "--reset",
             help=(
                 "Run in reset mode: roll the affected tables back to their last "
-                "checkpoint, then re-apply. Use ONLY for migrations that genuinely "
+                "checkpoint, then re-apply. Use ONLY for evolutions that genuinely "
                 "cannot be expressed idempotently — idempotent is the default and "
                 "the safety contract."
             ),
@@ -354,7 +354,7 @@ def apply_command(
     """Apply ``current.sql`` against the configured catalog.
 
     Idempotent mode is the default. Reset mode (``--reset`` or
-    ``[dev].mode = "reset"``) is the opt-in escape hatch for migrations
+    ``[dev].mode = "reset"``) is the opt-in escape hatch for evolutions
     that genuinely cannot be expressed idempotently: it rolls the affected
     tables back to their last checkpoint, then re-applies. Idempotent is
     the path; reset is the relief valve.
@@ -427,7 +427,7 @@ def redo_command(
 ) -> None:
     """Alias for ``cambrian apply --reset``.
 
-    Same semantics, shorter to type during a non-idempotent-migration
+    Same semantics, shorter to type during a non-idempotent-evolution
     dev loop. Reset is the relief valve — prefer idempotent SQL.
     """
     apply_command(
@@ -493,7 +493,7 @@ def commit_command(
         typer.Option(
             "--message",
             "-m",
-            help="Short description of the committed migration (becomes the file slug).",
+            help="Short description of the committed evolution (becomes the file slug).",
         ),
     ],
     path: Annotated[Path, _path_option()] = Path("./cambrian.toml"),
@@ -502,7 +502,7 @@ def commit_command(
         typer.Option("--json", help="Emit machine-readable JSON output."),
     ] = False,
 ) -> None:
-    """Freeze ``current.sql`` as a committed migration.
+    """Freeze ``current.sql`` as a committed evolution.
 
     Preconditions: ``current.sql`` is non-empty and applies cleanly (run
     ``cambrian apply`` first). The current text is moved to
@@ -532,9 +532,9 @@ def commit_command(
         typer.echo(json.dumps(_commit_payload(result), default=str))
         return
 
-    typer.echo(f"committed: {result.migration_id}")
+    typer.echo(f"committed: {result.evolution_id}")
     typer.echo(f"file:      {result.committed_path}")
-    typer.echo(f"hash:      {result.migration_hash[:12]}…")
+    typer.echo(f"hash:      {result.evolution_hash[:12]}…")
     typer.echo(f"event:     {result.event_id or '<none>'}")
     if result.affected_tables:
         typer.echo(f"tables:    {', '.join(result.affected_tables)}")
@@ -558,7 +558,7 @@ def uncommit_command(
         typer.Option("--json", help="Emit machine-readable JSON output."),
     ] = False,
 ) -> None:
-    """Pop the latest committed migration back into ``current.sql``.
+    """Pop the latest committed evolution back into ``current.sql``.
 
     Rolls the affected tables back to the checkpoint pinned at commit time
     and deletes the committed file. Refuses if downstream committed files
@@ -590,7 +590,7 @@ def uncommit_command(
         typer.echo(json.dumps(_uncommit_payload(result), default=str))
         return
 
-    typer.echo(f"uncommitted: {result.migration_id}")
+    typer.echo(f"uncommitted: {result.evolution_id}")
     typer.echo(f"restored:    {result.restored_path}")
     typer.echo(f"event:       {result.event_id or '<none>'}")
     if result.rolled_back_tables:
@@ -602,18 +602,18 @@ def uncommit_command(
 @app.command(
     "reset-to",
     help=(
-        "Roll affected tables back to a committed migration's checkpoint. "
+        "Roll affected tables back to a committed evolution's checkpoint. "
         "INCIDENT RESPONSE ONLY — does not delete committed files, does not "
         "touch downstream commit events. Reset is the relief valve, never "
         "the recommended fix; reach for idempotent SQL first."
     ),
 )
 def reset_to_command(
-    migration_id: Annotated[
+    evolution_id: Annotated[
         str,
         typer.Argument(
             help=(
-                "The committed migration id to roll back to, e.g. '0007_add_users'. "
+                "The committed evolution id to roll back to, e.g. '0007_add_users'. "
                 "See `cambrian status` for the live set."
             ),
         ),
@@ -624,10 +624,10 @@ def reset_to_command(
         typer.Option("--json", help="Emit machine-readable JSON output."),
     ] = False,
 ) -> None:
-    """Roll back to a specific committed migration's checkpoint (escape hatch).
+    """Roll back to a specific committed evolution's checkpoint (escape hatch).
 
     Use ONLY for incident response. Idempotent SQL is the safety contract;
-    if you find yourself reaching for this, file an issue with the migration
+    if you find yourself reaching for this, file an issue with the evolution
     that forced your hand so we can extend dispatch instead.
     """
     try:
@@ -637,7 +637,7 @@ def reset_to_command(
         raise typer.Exit(code=1) from exc
 
     try:
-        result = cambrian_reset_to(cfg, migration_id=migration_id)
+        result = cambrian_reset_to(cfg, evolution_id=evolution_id)
     except NotInitializedError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=EXIT_NOT_INITIALIZED) from exc
@@ -656,7 +656,7 @@ def reset_to_command(
         return
 
     typer.echo("mode:        reset --to (escape hatch — incident response only)")
-    typer.echo(f"migration:   {result.migration_id}")
+    typer.echo(f"evolution:   {result.evolution_id}")
     typer.echo(f"event:       {result.event_id or '<none>'}")
     if result.rolled_back_tables:
         typer.echo(f"rolled back: {', '.join(result.rolled_back_tables)}")
@@ -666,9 +666,9 @@ def reset_to_command(
 
 def _commit_payload(result: Any) -> dict[str, Any]:
     return {
-        "migration_id": result.migration_id,
+        "evolution_id": result.evolution_id,
         "committed_path": str(result.committed_path),
-        "migration_hash": result.migration_hash,
+        "evolution_hash": result.evolution_hash,
         "tag_ref": result.tag_ref,
         "event_id": result.event_id,
         "affected_tables": result.affected_tables,
@@ -677,7 +677,7 @@ def _commit_payload(result: Any) -> dict[str, Any]:
 
 def _uncommit_payload(result: Any) -> dict[str, Any]:
     return {
-        "migration_id": result.migration_id,
+        "evolution_id": result.evolution_id,
         "restored_path": str(result.restored_path),
         "restored_to_current": True,
         "event_id": result.event_id,
@@ -689,7 +689,7 @@ def _uncommit_payload(result: Any) -> dict[str, Any]:
 def _reset_to_payload(result: Any) -> dict[str, Any]:
     return {
         "mode": "reset --to",
-        "migration_id": result.migration_id,
+        "evolution_id": result.evolution_id,
         "event_id": result.event_id,
         "rolled_back_tables": result.rolled_back_tables,
         "skipped_tables": result.skipped_tables,
@@ -726,7 +726,7 @@ def watch_command(
         typer.Option(
             "--reset",
             help=(
-                "Run each re-apply in reset mode. Use ONLY for migrations that "
+                "Run each re-apply in reset mode. Use ONLY for evolutions that "
                 "genuinely cannot be expressed idempotently. Honours "
                 '``[dev].mode = "reset"`` from cambrian.toml as well.'
             ),
@@ -744,11 +744,11 @@ def watch_command(
         typer.Option("--json", help="Emit one JSON line per watch event."),
     ] = False,
 ) -> None:
-    """Watch the migrations directory and re-apply ``current.sql`` on every change.
+    """Watch the evolutions directory and re-apply ``current.sql`` on every change.
 
     Default mode is idempotent — the safety contract. ``--reset`` (or
     ``[dev].mode = "reset"``) enables the rollback-before-reapply path
-    for non-idempotent migrations. Use it sparingly. A parse or dispatch
+    for non-idempotent evolutions. Use it sparingly. A parse or dispatch
     error during a re-apply is reported and the loop keeps watching.
     """
     import asyncio as _asyncio
@@ -791,15 +791,15 @@ def _apply_payload(result: Any) -> dict[str, Any]:
     return {
         "mode": "idempotent",
         "status": result.status,
-        "migration_id": result.migration_id,
-        "migration_hash": result.migration_hash,
+        "evolution_id": result.evolution_id,
+        "evolution_hash": result.evolution_hash,
         "event_id": result.event_id,
         "sources": [str(p) for p in result.sources],
         "applied_committed": [
             {
-                "migration_id": c.migration_id,
+                "evolution_id": c.evolution_id,
                 "status": c.status,
-                "migration_hash": c.migration_hash,
+                "evolution_hash": c.evolution_hash,
                 "event_id": c.event_id,
                 "error": c.error,
             }
@@ -820,10 +820,10 @@ def _apply_payload(result: Any) -> dict[str, Any]:
 
 def _print_apply_human(result: Any) -> None:
     if result.status == "unchanged":
-        typer.echo(f"current.sql unchanged (hash {result.migration_hash[:12]}…); nothing to apply")
+        typer.echo(f"current.sql unchanged (hash {result.evolution_hash[:12]}…); nothing to apply")
         return
     typer.echo(f"status: {result.status}")
-    typer.echo(f"hash:   {result.migration_hash[:12]}…")
+    typer.echo(f"hash:   {result.evolution_hash[:12]}…")
     typer.echo(f"event:  {result.event_id or '<none>'}")
     if result.statements:
         typer.echo(f"statements: {len(result.statements)}")
@@ -843,7 +843,7 @@ def _reset_payload(result: Any) -> dict[str, Any]:
     return {
         "mode": "reset",
         "status": result.status,
-        "migration_hash": result.migration_hash,
+        "evolution_hash": result.evolution_hash,
         "rollback_event_id": result.rollback_event_id,
         "apply_event_id": result.apply_event_id,
         "sources": [str(p) for p in result.sources],
@@ -867,8 +867,8 @@ def _reset_payload(result: Any) -> dict[str, Any]:
 def _print_reset_human(result: Any) -> None:
     typer.echo("mode:   reset (escape hatch — idempotent is the recommended path)")
     typer.echo(f"status: {result.status}")
-    if result.migration_hash:
-        typer.echo(f"hash:   {result.migration_hash[:12]}…")
+    if result.evolution_hash:
+        typer.echo(f"hash:   {result.evolution_hash[:12]}…")
     typer.echo(f"rollback event: {result.rollback_event_id or '<none>'}")
     typer.echo(f"apply event:    {result.apply_event_id or '<none>'}")
     if result.rollbacks:
@@ -899,7 +899,7 @@ def _sync_payload(result: SyncResult) -> dict[str, Any]:
         "discrepancies": result.discrepancies,
         "files": [
             {
-                "migration_id": f.migration_id,
+                "evolution_id": f.evolution_id,
                 "path": str(f.path),
                 "status": f.status,
                 "catalog_hash": f.catalog_hash,

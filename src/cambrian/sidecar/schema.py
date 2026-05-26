@@ -50,9 +50,9 @@ EVENTS_SCHEMA = Schema(
     NestedField(field_id=2, name="event_ts", field_type=TimestamptzType(), required=True),
     # apply | rollback | commit | uncommit | checkpoint
     NestedField(field_id=3, name="event_type", field_type=StringType(), required=True),
-    NestedField(field_id=4, name="migration_id", field_type=StringType(), required=True),
-    NestedField(field_id=5, name="migration_hash", field_type=StringType(), required=True),
-    NestedField(field_id=6, name="migration_sql", field_type=StringType(), required=True),
+    NestedField(field_id=4, name="evolution_id", field_type=StringType(), required=True),
+    NestedField(field_id=5, name="evolution_hash", field_type=StringType(), required=True),
+    NestedField(field_id=6, name="evolution_sql", field_type=StringType(), required=True),
     NestedField(field_id=7, name="actor", field_type=StringType(), required=True),
     NestedField(field_id=8, name="notes", field_type=StringType(), required=False),
 )

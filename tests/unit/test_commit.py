@@ -21,7 +21,7 @@ from cambrian.migrate.commit import (
     COMMITTED_TAG_PREFIX,
     SLUG_MAX_LENGTH,
     CommittedFile,
-    compute_migration_hash,
+    compute_evolution_hash,
     discover_committed_files,
     next_sequence_number,
     parse_committed_filename,
@@ -43,10 +43,10 @@ def test_slugify_collapses_runs_and_strips_edges() -> None:
 
 
 def test_slugify_empty_falls_back() -> None:
-    assert slugify("") == "migration"
-    assert slugify("   ") == "migration"
-    assert slugify("---") == "migration"
-    assert slugify("!@#$%^&*()") == "migration"
+    assert slugify("") == "evolution"
+    assert slugify("   ") == "evolution"
+    assert slugify("---") == "evolution"
+    assert slugify("!@#$%^&*()") == "evolution"
 
 
 def test_slugify_unicode_normalises_to_ascii() -> None:
@@ -55,7 +55,7 @@ def test_slugify_unicode_normalises_to_ascii() -> None:
     # NFKD decomposes mathematical-script chars to their ASCII equivalents.
     assert slugify("𝓊𝓃𝒾𝒸𝑜𝒹𝑒") == "unicode"  # noqa: RUF001
     # Pure-non-decomposable chars (emoji) collapse to the fallback.
-    assert slugify("🎉🚀") == "migration"
+    assert slugify("🎉🚀") == "evolution"
 
 
 def test_slugify_preserves_existing_dashes_collapsed() -> None:
@@ -123,7 +123,7 @@ def test_discover_committed_files_ignores_unrecognised(tmp_path: Path) -> None:
     (tmp_path / "current.sql.bak").write_text("", encoding="utf-8")
     files = discover_committed_files(tmp_path)
     assert len(files) == 1
-    assert files[0].migration_id == "0001_real"
+    assert files[0].evolution_id == "0001_real"
 
 
 # ---------------------------------------------------------------------------
@@ -161,27 +161,27 @@ def test_next_sequence_number_refuses_start_above_1(tmp_path: Path) -> None:
 
 def test_committed_file_tag_ref_matches_documented_shape() -> None:
     cf = CommittedFile(number=7, slug="add-users", path=Path("/tmp/0007_add-users.sql"))
-    assert cf.migration_id == "0007_add-users"
+    assert cf.evolution_id == "0007_add-users"
     # CLAUDE.md specifies cambrian.committed.<n>.<msg> — n unpadded, msg = slug.
     assert cf.tag_ref() == "cambrian.committed.7.add-users"
     assert cf.tag_ref().startswith(COMMITTED_TAG_PREFIX)
 
 
 # ---------------------------------------------------------------------------
-# compute_migration_hash
+# compute_evolution_hash
 # ---------------------------------------------------------------------------
 
 
-def test_compute_migration_hash_stable() -> None:
-    h1 = compute_migration_hash("CREATE TABLE t (id BIGINT);")
-    h2 = compute_migration_hash("CREATE TABLE t (id BIGINT);")
+def test_compute_evolution_hash_stable() -> None:
+    h1 = compute_evolution_hash("CREATE TABLE t (id BIGINT);")
+    h2 = compute_evolution_hash("CREATE TABLE t (id BIGINT);")
     assert h1 == h2
     assert len(h1) == 64  # sha256 hex
 
 
-def test_compute_migration_hash_differs_on_change() -> None:
-    h1 = compute_migration_hash("foo")
-    h2 = compute_migration_hash("bar")
+def test_compute_evolution_hash_differs_on_change() -> None:
+    h1 = compute_evolution_hash("foo")
+    h2 = compute_evolution_hash("bar")
     assert h1 != h2
 
 
@@ -199,9 +199,9 @@ def _make_catalog(rows: list[dict]) -> MagicMock:
                 "event_id": [r["event_id"] for r in rows],
                 "event_ts": [r["event_ts"] for r in rows],
                 "event_type": [r["event_type"] for r in rows],
-                "migration_id": [r["migration_id"] for r in rows],
-                "migration_hash": [r["migration_hash"] for r in rows],
-                "migration_sql": [r.get("migration_sql", "") for r in rows],
+                "evolution_id": [r["evolution_id"] for r in rows],
+                "evolution_hash": [r["evolution_hash"] for r in rows],
+                "evolution_sql": [r.get("evolution_sql", "") for r in rows],
                 "actor": [r.get("actor", "test") for r in rows],
                 "notes": [r.get("notes", None) for r in rows],
             }
@@ -212,9 +212,9 @@ def _make_catalog(rows: list[dict]) -> MagicMock:
                 "event_id": pa.array([], pa.string()),
                 "event_ts": pa.array([], pa.timestamp("us", tz="UTC")),
                 "event_type": pa.array([], pa.string()),
-                "migration_id": pa.array([], pa.string()),
-                "migration_hash": pa.array([], pa.string()),
-                "migration_sql": pa.array([], pa.string()),
+                "evolution_id": pa.array([], pa.string()),
+                "evolution_hash": pa.array([], pa.string()),
+                "evolution_sql": pa.array([], pa.string()),
                 "actor": pa.array([], pa.string()),
                 "notes": pa.array([], pa.string()),
             }
@@ -242,15 +242,15 @@ def test_applied_committed_ids_includes_applied_committed() -> None:
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(1),
                 "event_type": "commit",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(2),
                 "event_type": "apply",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
         ]
     )
@@ -264,15 +264,15 @@ def test_applied_committed_ids_excludes_uncommitted() -> None:
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(1),
                 "event_type": "apply",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(2),
                 "event_type": "uncommit",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
         ]
     )
@@ -280,29 +280,29 @@ def test_applied_committed_ids_excludes_uncommitted() -> None:
 
 
 def test_applied_committed_ids_re_applied_after_uncommit() -> None:
-    """uncommit then commit-and-apply again → migration is applied again."""
+    """uncommit then commit-and-apply again → evolution is applied again."""
     catalog = _make_catalog(
         [
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(1),
                 "event_type": "apply",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(2),
                 "event_type": "uncommit",
-                "migration_id": "0001_first",
-                "migration_hash": "abc",
+                "evolution_id": "0001_first",
+                "evolution_hash": "abc",
             },
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(3),
                 "event_type": "apply",
-                "migration_id": "0001_first",
-                "migration_hash": "def",
+                "evolution_id": "0001_first",
+                "evolution_hash": "def",
             },
         ]
     )
@@ -310,15 +310,15 @@ def test_applied_committed_ids_re_applied_after_uncommit() -> None:
 
 
 def test_applied_committed_ids_ignores_current() -> None:
-    """``migration_id="current"`` (the dev-loop slot) is never in the applied set."""
+    """``evolution_id="current"`` (the dev-loop slot) is never in the applied set."""
     catalog = _make_catalog(
         [
             {
                 "event_id": str(uuid.uuid4()),
                 "event_ts": _ts(1),
                 "event_type": "apply",
-                "migration_id": "current",
-                "migration_hash": "abc",
+                "evolution_id": "current",
+                "evolution_hash": "abc",
             },
         ]
     )

@@ -9,7 +9,7 @@ The lifecycle:
   the affected tables back to the pinned checkpoint, emits an ``uncommit``
   event. Refuses if there are downstream committed files (gap) or if
   ``current.sql`` is non-empty (``--force`` overrides).
-* ``reset --to <migration_id>`` rolls the affected tables of *migration_id*
+* ``reset --to <evolution_id>`` rolls the affected tables of *evolution_id*
   back to that commit's pinned checkpoint. Escape hatch only — does NOT
   delete the committed file, does NOT touch downstream commit events.
 
@@ -32,8 +32,8 @@ import sqlglot
 from cambrian.catalog import load_catalog
 from cambrian.errors import (
     CambrianError,
+    EvolutionNotFoundError,
     IllegalStateError,
-    MigrationNotFoundError,
 )
 from cambrian.iceberg.affected import (
     TableIdent,
@@ -65,7 +65,7 @@ __all__ = [
     "cambrian_commit",
     "cambrian_reset_to",
     "cambrian_uncommit",
-    "compute_migration_hash",
+    "compute_evolution_hash",
     "discover_committed_files",
     "next_sequence_number",
     "parse_committed_filename",
@@ -89,7 +89,7 @@ class CommittedFile:
     path: Path
 
     @property
-    def migration_id(self) -> str:
+    def evolution_id(self) -> str:
         return f"{self.number:04d}_{self.slug}"
 
     def tag_ref(self) -> str:
@@ -100,9 +100,9 @@ class CommittedFile:
 class CommitResult:
     """Outcome of a ``cambrian commit``."""
 
-    migration_id: str
+    evolution_id: str
     committed_path: Path
-    migration_hash: str
+    evolution_hash: str
     event_id: str | None
     affected_tables: list[str] = field(default_factory=list)
     tag_ref: str = ""
@@ -112,7 +112,7 @@ class CommitResult:
 class UncommitResult:
     """Outcome of a ``cambrian uncommit``."""
 
-    migration_id: str
+    evolution_id: str
     restored_path: Path
     event_id: str | None
     rolled_back_tables: list[str] = field(default_factory=list)
@@ -121,9 +121,9 @@ class UncommitResult:
 
 @dataclass
 class ResetToResult:
-    """Outcome of ``cambrian reset --to <migration_id>``."""
+    """Outcome of ``cambrian reset --to <evolution_id>``."""
 
-    migration_id: str
+    evolution_id: str
     event_id: str | None
     rolled_back_tables: list[str] = field(default_factory=list)
     skipped_tables: list[str] = field(default_factory=list)
@@ -132,7 +132,7 @@ class ResetToResult:
 def slugify(msg: str) -> str:
     """Lowercase ASCII-safe dash-joined slug; collapses runs, trims, length-capped.
 
-    Empty / all-non-alphanumeric input collapses to ``"migration"`` rather
+    Empty / all-non-alphanumeric input collapses to ``"evolution"`` rather
     than to the empty string — a missing slug would yield a malformed filename.
     """
     normalized = unicodedata.normalize("NFKD", msg)
@@ -141,12 +141,12 @@ def slugify(msg: str) -> str:
     dashed = _SLUG_REPLACE_RE.sub("-", lowered)
     trimmed = _SLUG_TRIM_RE.sub("", dashed)
     if not trimmed:
-        return "migration"
+        return "evolution"
     if len(trimmed) > SLUG_MAX_LENGTH:
         # Trim from the right then strip a trailing dash that the cut may have left.
         trimmed = _SLUG_TRIM_RE.sub("", trimmed[:SLUG_MAX_LENGTH])
         if not trimmed:
-            return "migration"
+            return "evolution"
     return trimmed
 
 
@@ -202,7 +202,7 @@ def next_sequence_number(committed_dir: Path) -> int:
     return numbers[-1] + 1
 
 
-def compute_migration_hash(text: str) -> str:
+def compute_evolution_hash(text: str) -> str:
     """sha256 hex of *text*, encoded as UTF-8. The cross-cambrian canonical hash."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -213,7 +213,7 @@ def cambrian_commit(
     message: str,
     actor: str | None = None,
 ) -> CommitResult:
-    """Freeze the current state into a committed migration.
+    """Freeze the current state into a committed evolution.
 
     Preconditions:
 
@@ -232,48 +232,48 @@ def cambrian_commit(
     4. Emit a ``commit`` event referencing every checkpoint.
 
     Raises:
-        MigrationNotFoundError: ``current.sql`` doesn't exist.
+        EvolutionNotFoundError: ``current.sql`` doesn't exist.
         IllegalStateError: ``current.sql`` is empty, or the most recent apply
             event's hash doesn't match the file (commit on dirty state).
     """
-    from cambrian.migrate.runner import CURRENT_MIGRATION_ID
+    from cambrian.migrate.runner import CURRENT_EVOLUTION_ID
 
     if not message.strip():
         raise IllegalStateError("commit message must be non-empty")
 
-    migrations_dir = Path(config.migrations.dir).resolve()
-    current_path = migrations_dir / "current.sql"
+    evolutions_dir = Path(config.evolutions.dir).resolve()
+    current_path = evolutions_dir / "current.sql"
     if not current_path.exists():
-        raise MigrationNotFoundError(
+        raise EvolutionNotFoundError(
             f"current.sql not found at {current_path} "
-            f"(config: migrations.dir = {config.migrations.dir})"
+            f"(config: evolutions.dir = {config.evolutions.dir})"
         )
 
     expanded = expand(current_path)
     if not expanded.text.strip():
         raise IllegalStateError(
-            "current.sql is empty; nothing to commit. Write the migration first, "
+            "current.sql is empty; nothing to commit. Write the evolution first, "
             "run `cambrian apply` to verify it works, then commit."
         )
 
     catalog = load_catalog(config)
     state = ensure_current(
         catalog,
-        config.migrations.sidecar_namespace,
+        config.evolutions.sidecar_namespace,
         allow_read_only=False,
     )
     namespace = state.sidecar_namespace
 
     last_apply = latest_event(
-        catalog, namespace, event_type="apply", migration_id=CURRENT_MIGRATION_ID
+        catalog, namespace, event_type="apply", evolution_id=CURRENT_EVOLUTION_ID
     )
-    if last_apply is None or last_apply.migration_hash != expanded.hash:
+    if last_apply is None or last_apply.evolution_hash != expanded.hash:
         raise IllegalStateError(
             "current.sql has not been applied (or has been edited since the last apply). "
             "Run `cambrian apply` first; commit is only safe on a clean idempotent state."
         )
 
-    committed_dir = migrations_dir / "committed"
+    committed_dir = evolutions_dir / "committed"
     committed_dir.mkdir(parents=True, exist_ok=True)
     number = next_sequence_number(committed_dir)
     slug = slugify(message)
@@ -345,18 +345,18 @@ def cambrian_commit(
         catalog,
         namespace,
         event_type="commit",
-        migration_id=new_file.migration_id,
-        migration_hash=expanded.hash,
-        migration_sql=expanded.text,
+        evolution_id=new_file.evolution_id,
+        evolution_hash=expanded.hash,
+        evolution_sql=expanded.text,
         actor=actor or _make_actor(),
         notes=f"committed {len(idents)} table(s); tag={tag_name}",
         table_states=table_states,
     )
 
     return CommitResult(
-        migration_id=new_file.migration_id,
+        evolution_id=new_file.evolution_id,
         committed_path=new_file.path,
-        migration_hash=expanded.hash,
+        evolution_hash=expanded.hash,
         event_id=event_id,
         affected_tables=[str(i) for i in idents],
         tag_ref=tag_name,
@@ -369,7 +369,7 @@ def cambrian_uncommit(
     force: bool = False,
     actor: str | None = None,
 ) -> UncommitResult:
-    """Pop the latest committed migration back to ``current.sql`` and rollback.
+    """Pop the latest committed evolution back to ``current.sql`` and rollback.
 
     Preconditions:
 
@@ -391,12 +391,12 @@ def cambrian_uncommit(
         IllegalStateError: no committed files; downstream files exist;
             ``current.sql`` is non-empty without *force*.
     """
-    migrations_dir = Path(config.migrations.dir).resolve()
-    committed_dir = migrations_dir / "committed"
+    evolutions_dir = Path(config.evolutions.dir).resolve()
+    committed_dir = evolutions_dir / "committed"
     files = discover_committed_files(committed_dir)
     if not files:
         raise IllegalStateError(
-            "no committed migrations to uncommit. The committed/ directory is empty."
+            "no committed evolutions to uncommit. The committed/ directory is empty."
         )
 
     latest_file = files[-1]
@@ -406,7 +406,7 @@ def cambrian_uncommit(
             f"committed/ numbering has gap(s); refusing to uncommit. Found numbers {numbers}."
         )
 
-    current_path = migrations_dir / "current.sql"
+    current_path = evolutions_dir / "current.sql"
     current_existing = current_path.read_text(encoding="utf-8") if current_path.exists() else ""
     if current_existing.strip() and not force:
         raise IllegalStateError(
@@ -417,13 +417,13 @@ def cambrian_uncommit(
     catalog = load_catalog(config)
     state = ensure_current(
         catalog,
-        config.migrations.sidecar_namespace,
+        config.evolutions.sidecar_namespace,
         allow_read_only=False,
     )
     namespace = state.sidecar_namespace
 
     commit_event = latest_event(
-        catalog, namespace, event_type="commit", migration_id=latest_file.migration_id
+        catalog, namespace, event_type="commit", evolution_id=latest_file.evolution_id
     )
     if commit_event is None:
         raise IllegalStateError(
@@ -461,19 +461,19 @@ def cambrian_uncommit(
         catalog,
         namespace,
         event_type="uncommit",
-        migration_id=latest_file.migration_id,
-        migration_hash=commit_event.migration_hash,
-        migration_sql=committed_text,
+        evolution_id=latest_file.evolution_id,
+        evolution_hash=commit_event.evolution_hash,
+        evolution_sql=committed_text,
         actor=actor or _make_actor(),
         notes=(
-            f"uncommitted {latest_file.migration_id}; "
+            f"uncommitted {latest_file.evolution_id}; "
             f"rolled back {len(rolled_back)} of {len(rows)} tables"
         ),
         table_states=rollback_states,
     )
 
     return UncommitResult(
-        migration_id=latest_file.migration_id,
+        evolution_id=latest_file.evolution_id,
         restored_path=current_path,
         event_id=event_id,
         rolled_back_tables=rolled_back,
@@ -484,10 +484,10 @@ def cambrian_uncommit(
 def cambrian_reset_to(
     config: CambrianConfig,
     *,
-    migration_id: str,
+    evolution_id: str,
     actor: str | None = None,
 ) -> ResetToResult:
-    """Roll affected tables back to the checkpoint pinned at *migration_id*.
+    """Roll affected tables back to the checkpoint pinned at *evolution_id*.
 
     Escape hatch — for incident response only. Does NOT delete the
     committed file. Does NOT touch downstream commit events. Emits a
@@ -496,15 +496,15 @@ def cambrian_reset_to(
     catalog = load_catalog(config)
     state = ensure_current(
         catalog,
-        config.migrations.sidecar_namespace,
+        config.evolutions.sidecar_namespace,
         allow_read_only=False,
     )
     namespace = state.sidecar_namespace
 
-    commit_event = latest_event(catalog, namespace, event_type="commit", migration_id=migration_id)
+    commit_event = latest_event(catalog, namespace, event_type="commit", evolution_id=evolution_id)
     if commit_event is None:
         raise IllegalStateError(
-            f"no commit event found for migration_id={migration_id!r}. "
+            f"no commit event found for evolution_id={evolution_id!r}. "
             "Check `cambrian status` for the valid set."
         )
 
@@ -515,7 +515,7 @@ def cambrian_reset_to(
     for row in rows:
         # reset --to restores to the *post-state* of the named commit (the
         # state captured + tag-pinned at commit time), not its pre-state
-        # (which is the previous migration's resting state).
+        # (which is the previous evolution's resting state).
         target = TableStateRow(
             table_ident=row.table_ident,
             pre_snapshot_id=row.post_snapshot_id,
@@ -539,19 +539,19 @@ def cambrian_reset_to(
         catalog,
         namespace,
         event_type="rollback",
-        migration_id=migration_id,
-        migration_hash=commit_event.migration_hash,
-        migration_sql=commit_event.migration_sql,
+        evolution_id=evolution_id,
+        evolution_hash=commit_event.evolution_hash,
+        evolution_sql=commit_event.evolution_sql,
         actor=actor or _make_actor(),
         notes=(
-            f"reset --to {migration_id}; rolled back {len(rolled_back)} of {len(rows)} tables. "
+            f"reset --to {evolution_id}; rolled back {len(rolled_back)} of {len(rows)} tables. "
             "Audit trail preserved; downstream commit events are untouched."
         ),
         table_states=rollback_states,
     )
 
     return ResetToResult(
-        migration_id=migration_id,
+        evolution_id=evolution_id,
         event_id=event_id,
         rolled_back_tables=rolled_back,
         skipped_tables=skipped,

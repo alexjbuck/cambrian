@@ -1,6 +1,6 @@
 """``watchfiles``-driven hot-reload loop for ``current.sql`` and resolved includes.
 
-The dev loop: watch the migrations directory, debounce rapid edits via
+The dev loop: watch the evolutions directory, debounce rapid edits via
 ``watchfiles.awatch(debounce=...)``, then re-resolve includes (their set
 may have changed) and call ``apply_idempotent``. A parse failure in the
 SQL prints the error and *keeps watching* — the loop only exits on
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from watchfiles import Change, awatch
 
-from cambrian.errors import CambrianError, MigrationNotFoundError
+from cambrian.errors import CambrianError, EvolutionNotFoundError
 from cambrian.migrate.runner import ApplyResult, apply_idempotent
 
 if TYPE_CHECKING:
@@ -93,13 +93,13 @@ def _format_human(event: WatchEvent) -> str:
         return f"error{location}: {event.error}"
     if event.kind == "unchanged":
         return (
-            f"unchanged (hash {event.result.migration_hash[:12]}…)" if event.result else "unchanged"
+            f"unchanged (hash {event.result.evolution_hash[:12]}…)" if event.result else "unchanged"
         )
     if event.result is None:
         return event.kind
     head_changes = ", ".join(sorted(event.paths_changed)[:3]) or "<no fs paths>"
     return (
-        f"{event.kind} after change(s) in {head_changes} (hash {event.result.migration_hash[:12]}…)"
+        f"{event.kind} after change(s) in {head_changes} (hash {event.result.evolution_hash[:12]}…)"
     )
 
 
@@ -111,7 +111,7 @@ def _format_json(event: WatchEvent) -> str:
     }
     if event.result is not None:
         payload["status"] = event.result.status
-        payload["migration_hash"] = event.result.migration_hash
+        payload["evolution_hash"] = event.result.evolution_hash
         payload["event_id"] = event.result.event_id
         payload["sources"] = [str(p) for p in event.result.sources]
     return json.dumps(payload, default=str)
@@ -140,7 +140,7 @@ async def _run_apply(
         )
         return ApplyResult(
             status=reset_result.status,
-            migration_hash=reset_result.migration_hash,
+            evolution_hash=reset_result.evolution_hash,
             sources=reset_result.sources,
             statements=(reset_result.apply_result.statements if reset_result.apply_result else []),
             event_id=reset_result.apply_event_id,
@@ -176,7 +176,7 @@ async def watch(
     Parameters
     ----------
     config:
-        Loaded ``CambrianConfig`` — provides ``migrations.dir`` and
+        Loaded ``CambrianConfig`` — provides ``evolutions.dir`` and
         ``dev.debounce_ms``.
     debounce_ms:
         Override the config's debounce. ``None`` falls through to
@@ -251,9 +251,9 @@ def _resolve_watch_targets(config: CambrianConfig) -> list[Path]:
 
     Best-effort: try expanding ``current.sql`` to learn every transitively
     included file, then dedupe their parent directories. If ``current.sql``
-    doesn't exist or fails to parse, fall back to the migrations dir alone.
+    doesn't exist or fails to parse, fall back to the evolutions dir alone.
     """
-    base = Path(config.migrations.dir).resolve()
+    base = Path(config.evolutions.dir).resolve()
     fallback = [base]
     try:
         # Local import to avoid importing the SQL stack at module load time
@@ -264,7 +264,7 @@ def _resolve_watch_targets(config: CambrianConfig) -> list[Path]:
         if not current.exists():
             return fallback
         expanded = expand(current)
-    except (MigrationNotFoundError, CambrianError, OSError):
+    except (EvolutionNotFoundError, CambrianError, OSError):
         return fallback
 
     targets: list[Path] = []

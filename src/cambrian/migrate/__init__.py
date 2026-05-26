@@ -1,4 +1,4 @@
-"""Migration orchestration: apply, watch, commit/uncommit, sync.
+"""Evolution orchestration: apply, watch, commit/uncommit, sync.
 
 The ``watch`` and ``runner`` submodules are deliberately *not* re-exported
 at the package level: doing so shadows the submodule attribute on the

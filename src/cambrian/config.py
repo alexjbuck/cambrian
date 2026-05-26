@@ -6,9 +6,9 @@ The on-disk schema is ``cambrian.toml`` with four top-level tables:
   :func:`pyiceberg.catalog.load_catalog`). ``type`` and ``uri`` are required;
   everything else is open-ended so we don't have to chase every future
   catalog flavor.
-- ``[migrations]``: location of the on-disk migration scripts and the names
+- ``[evolutions]``: location of the on-disk evolution scripts and the names
   of the sidecar namespace + table.
-- ``[migrations.sidecar_catalog]`` (optional): override the catalog used to
+- ``[evolutions.sidecar_catalog]`` (optional): override the catalog used to
   store sidecar tables, otherwise the main ``[catalog]`` is reused.
 - ``[dev]``: developer-loop knobs (mode/watch/debounce_ms), optional.
 
@@ -41,7 +41,7 @@ __all__ = [
     "CambrianConfig",
     "CatalogConfig",
     "DevConfig",
-    "MigrationsConfig",
+    "EvolutionsConfig",
     "load_config",
     "redacted_dump",
 ]
@@ -122,8 +122,8 @@ class _SidecarCatalogOverride(BaseModel):
     uri: str
 
 
-class MigrationsConfig(BaseModel):
-    """Where migrations live on disk and how the sidecar is named.
+class EvolutionsConfig(BaseModel):
+    """Where evolutions live on disk and how the sidecar is named.
 
     The sidecar's table names (``events``, ``table_states``, ``version``) are
     fixed internal constants; only the *namespace* is user-configurable.
@@ -131,7 +131,7 @@ class MigrationsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dir: str = Field(default="./migrations", description="Directory holding .sql migrations.")
+    dir: str = Field(default="./evolutions", description="Directory holding .sql evolutions.")
     sidecar_namespace: str = Field(
         default="_cambrian",
         description="Namespace that holds the cambrian sidecar tables.",
@@ -156,13 +156,13 @@ class CambrianConfig(BaseModel):
     """Top-level cambrian config.
 
     ``extra="forbid"`` is intentional at the root so a typo like
-    ``[migration]`` (singular) fails loudly instead of being silently ignored.
+    ``[evolution]`` (singular) fails loudly instead of being silently ignored.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     catalog: CatalogConfig
-    migrations: MigrationsConfig = Field(default_factory=MigrationsConfig)
+    evolutions: EvolutionsConfig = Field(default_factory=EvolutionsConfig)
     dev: DevConfig = Field(default_factory=DevConfig)
 
 

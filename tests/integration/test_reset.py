@@ -21,10 +21,10 @@ from anyio import Event
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NamespaceNotEmptyError, NoSuchNamespaceError
 
-from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, MigrationsConfig
+from cambrian.config import CambrianConfig, CatalogConfig, DevConfig, EvolutionsConfig
 from cambrian.errors import ExternalWriteDetectedError
 from cambrian.migrate.runner import (
-    CURRENT_MIGRATION_ID,
+    CURRENT_EVOLUTION_ID,
     apply_idempotent,
     apply_reset,
     rollback_to_last_checkpoint,
@@ -37,7 +37,7 @@ WAREHOUSE = "cambrian"
 
 
 def _build_config(
-    *, migrations_dir: Path, sidecar_namespace: str, debounce_ms: int = 100
+    *, evolutions_dir: Path, sidecar_namespace: str, debounce_ms: int = 100
 ) -> CambrianConfig:
     return CambrianConfig(
         catalog=CatalogConfig(
@@ -52,8 +52,8 @@ def _build_config(
                 "s3.path-style-access": "true",
             },
         ),
-        migrations=MigrationsConfig(
-            dir=str(migrations_dir),
+        evolutions=EvolutionsConfig(
+            dir=str(evolutions_dir),
             sidecar_namespace=sidecar_namespace,
         ),
         dev=DevConfig(debounce_ms=debounce_ms),
@@ -105,8 +105,8 @@ def test_reset_roundtrip(
     semantic of M4's restore_pointers.
     """
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
 
     # Bootstrap the table and insert one row idempotently so the table
     # has a snapshot *before* the first reset captures its pre-state.
@@ -121,7 +121,7 @@ def test_reset_roundtrip(
             f"INSERT INTO {ns}.t VALUES (0, 'seed');\n"
         ),
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
     apply_idempotent(cfg)
 
     # Switch to reset mode: current.sql now only declares alice (no seed
@@ -167,13 +167,13 @@ def test_reset_external_write_refused_without_force(
 ) -> None:
     """Out-of-band write since last apply → reset refuses unless --force."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(
         current,
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
 
     # First reset: captures checkpoint, no actual rollback.
     apply_reset(cfg)
@@ -211,13 +211,13 @@ def test_rollback_command_undoes_last_apply(
 ) -> None:
     """``rollback_to_last_checkpoint`` undoes the prior apply without re-executing."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(
         current,
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
 
     # Apply twice so we have a prior checkpoint to roll back to.
     apply_idempotent(cfg)
@@ -246,13 +246,13 @@ def test_rollback_command_undoes_last_apply(
     assert rb.rollback_event_id is not None
     assert any(r.rolled_back for r in rb.rollbacks), rb.rollbacks
 
-    # The rollback event is now the most recent event for migration_id="current".
+    # The rollback event is now the most recent event for evolution_id="current".
     verify = _verify_catalog()
     latest = latest_event(
         verify,
         sidecar_ns,
         event_type="rollback",
-        migration_id=CURRENT_MIGRATION_ID,
+        evolution_id=CURRENT_EVOLUTION_ID,
     )
     assert latest is not None
     assert latest.event_id == rb.rollback_event_id
@@ -303,13 +303,13 @@ def test_watch_reset_coalesces_rapid_edits(
 ) -> None:
     """Two rapid writes under watch+reset → one rollback+apply cycle, not two."""
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(
         current,
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns, debounce_ms=500)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns, debounce_ms=500)
 
     async def _rapid_edits() -> None:
         await asyncio.sleep(0.7)
@@ -356,13 +356,13 @@ def test_reset_unchanged_when_hash_matches(
     via the M5 hash check.
     """
     del rest_catalog
-    migrations = tmp_path / "migrations"
-    current = migrations / "current.sql"
+    evolutions = tmp_path / "evolutions"
+    current = evolutions / "current.sql"
     _write(
         current,
         f"CREATE TABLE IF NOT EXISTS {ns}.t (id BIGINT) USING iceberg;\n",
     )
-    cfg = _build_config(migrations_dir=migrations, sidecar_namespace=sidecar_ns)
+    cfg = _build_config(evolutions_dir=evolutions, sidecar_namespace=sidecar_ns)
 
     r1 = apply_reset(cfg)
     assert r1.status == "applied"
