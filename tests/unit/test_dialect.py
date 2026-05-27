@@ -17,9 +17,14 @@ from sqlglot import expressions as exp
 
 from cambrian.sql.ast import (
     AddPartitionField,
+    AlterColumnPosition,
+    AlterNamespaceProperties,
+    DropIdentifierFields,
     DropPartitionField,
     ReplacePartitionField,
+    SetIdentifierFields,
     UnsetTblProperties,
+    WriteDistribution,
     WriteOrderedBy,
 )
 from cambrian.sql.dialect import CambrianSpark
@@ -151,6 +156,147 @@ def test_write_ordered_by_with_direction() -> None:
     assert len(cols) == 2
     assert cols[0].args.get("desc") in (False, None)
     assert cols[1].args.get("desc") is True
+
+
+# ---------------------------------------------------------------------------
+# WRITE ORDERED BY — unparenthesized canonical form + distribution family
+# ---------------------------------------------------------------------------
+
+
+def test_write_ordered_by_bare_comma_list() -> None:
+    actions = _alter_actions("ALTER TABLE t WRITE ORDERED BY category, id")
+    action = actions[0]
+    assert isinstance(action, WriteOrderedBy)
+    cols = action.args.get("expressions") or []
+    assert len(cols) == 2
+    assert all(isinstance(c, exp.Ordered) for c in cols)
+
+
+def test_write_ordered_by_asc_desc_nulls() -> None:
+    actions = _alter_actions(
+        "ALTER TABLE t WRITE ORDERED BY category ASC NULLS LAST, id DESC NULLS FIRST"
+    )
+    action = actions[0]
+    assert isinstance(action, WriteOrderedBy)
+    cols = action.args.get("expressions") or []
+    assert cols[0].args.get("desc") is False
+    assert cols[1].args.get("desc") is True
+
+
+def test_write_ordered_by_transform() -> None:
+    actions = _alter_actions("ALTER TABLE t WRITE ORDERED BY bucket(16, id)")
+    action = actions[0]
+    assert isinstance(action, WriteOrderedBy)
+    assert len(action.args.get("expressions") or []) == 1
+
+
+def test_write_locally_ordered_by() -> None:
+    actions = _alter_actions("ALTER TABLE t WRITE LOCALLY ORDERED BY category, id")
+    action = actions[0]
+    assert isinstance(action, WriteDistribution)
+    assert action.args.get("mode") == "none"
+    assert len(action.args.get("expressions") or []) == 2
+
+
+def test_write_distributed_by_partition() -> None:
+    actions = _alter_actions("ALTER TABLE t WRITE DISTRIBUTED BY PARTITION")
+    action = actions[0]
+    assert isinstance(action, WriteDistribution)
+    assert action.args.get("mode") == "hash"
+    assert not (action.args.get("expressions") or [])
+
+
+def test_write_distributed_locally_ordered() -> None:
+    actions = _alter_actions(
+        "ALTER TABLE t WRITE DISTRIBUTED BY PARTITION LOCALLY ORDERED BY category, id"
+    )
+    action = actions[0]
+    assert isinstance(action, WriteDistribution)
+    assert action.args.get("mode") == "hash"
+    assert len(action.args.get("expressions") or []) == 2
+
+
+def test_write_unordered() -> None:
+    actions = _alter_actions("ALTER TABLE t WRITE UNORDERED")
+    action = actions[0]
+    assert isinstance(action, WriteDistribution)
+    assert action.args.get("mode") == "unordered"
+
+
+# ---------------------------------------------------------------------------
+# ALTER COLUMN reposition / identifier fields / dotted ADD COLUMN
+# ---------------------------------------------------------------------------
+
+
+def test_alter_column_first_parses() -> None:
+    actions = _alter_actions("ALTER TABLE t ALTER COLUMN c FIRST")
+    action = actions[0]
+    assert isinstance(action, AlterColumnPosition)
+    assert action.args.get("position") == "FIRST"
+
+
+def test_alter_column_after_parses() -> None:
+    actions = _alter_actions("ALTER TABLE t ALTER COLUMN c AFTER d")
+    action = actions[0]
+    assert isinstance(action, AlterColumnPosition)
+    assert action.args.get("position") == "AFTER"
+    assert action.args.get("after").name == "d"
+
+
+def test_alter_column_comment_only_still_alter_column() -> None:
+    actions = _alter_actions("ALTER TABLE t ALTER COLUMN c COMMENT 'x'")
+    action = actions[0]
+    assert isinstance(action, exp.AlterColumn)
+    assert action.args.get("dtype") is None
+    assert action.args.get("comment") is not None
+
+
+def test_add_column_dotted_path_parses() -> None:
+    actions = _alter_actions("ALTER TABLE t ADD COLUMN point.z DOUBLE")
+    action = actions[0]
+    assert isinstance(action, exp.ColumnDef)
+    assert action.name == "point.z"
+
+
+def test_set_identifier_fields_parses() -> None:
+    actions = _alter_actions("ALTER TABLE t SET IDENTIFIER FIELDS id, data")
+    action = actions[0]
+    assert isinstance(action, SetIdentifierFields)
+    assert len(action.args.get("expressions") or []) == 2
+
+
+def test_drop_identifier_fields_parses() -> None:
+    actions = _alter_actions("ALTER TABLE t DROP IDENTIFIER FIELDS id")
+    action = actions[0]
+    assert isinstance(action, DropIdentifierFields)
+    assert len(action.args.get("expressions") or []) == 1
+
+
+# ---------------------------------------------------------------------------
+# Namespace properties / rename table
+# ---------------------------------------------------------------------------
+
+
+def test_create_namespace_with_properties_parses() -> None:
+    node = _single("CREATE NAMESPACE foo WITH PROPERTIES ('owner' = 'eng')")
+    assert isinstance(node, exp.Create)
+    assert (node.args.get("kind") or "").upper() == "NAMESPACE"
+    props = node.args.get("properties")
+    assert isinstance(props, exp.Properties)
+    assert len(props.expressions) == 1
+
+
+def test_alter_namespace_set_properties_parses() -> None:
+    node = _single("ALTER NAMESPACE foo SET PROPERTIES ('owner' = 'data')")
+    assert isinstance(node, AlterNamespaceProperties)
+    assert len(node.args.get("expressions") or []) == 1
+
+
+def test_rename_table_parses() -> None:
+    actions = _alter_actions("ALTER TABLE foo.t RENAME TO foo.t2")
+    action = actions[0]
+    assert isinstance(action, exp.AlterRename)
+    assert isinstance(action.args.get("this"), exp.Table)
 
 
 # ---------------------------------------------------------------------------
