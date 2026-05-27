@@ -21,6 +21,7 @@ requires one schema change per commit. Each commit is a fresh transaction.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -1035,17 +1036,43 @@ def _dispatch_delete(catalog: Catalog, stmt: exp.Delete) -> DispatchResult:
     where = stmt.args.get("where")
     if where is not None:
         # PyIceberg parses a string row filter itself; render the WHERE
-        # predicate to Spark SQL and hand it the string. DELETE is naturally
-        # idempotent — a re-run matches no rows.
+        # predicate to Spark SQL and hand it the string.
         predicate = where.this
         delete_filter = predicate.sql(dialect="spark")
-        table.delete(delete_filter=delete_filter)
-        notes = f"delete from {'.'.join(identifier)} where {delete_filter}"
+        matched = _delete(table, delete_filter=delete_filter)
+        base = f"delete from {'.'.join(identifier)} where {delete_filter}"
+        # A re-run of a DELETE matches no rows — the idempotent steady state,
+        # not an error. Reflect it as a note instead of leaking PyIceberg's
+        # raw "did not match any records" warning to stderr every re-apply.
+        notes = base if matched else f"{base}: matched no rows (idempotent)"
     else:
-        # DELETE with no WHERE → delete all rows (PyIceberg's AlwaysTrue default).
-        table.delete()
-        notes = f"delete all rows from {'.'.join(identifier)}"
+        matched = _delete(table)
+        base = f"delete all rows from {'.'.join(identifier)}"
+        notes = base if matched else f"{base}: matched no rows (idempotent)"
     return DispatchResult(affected_tables=affected_tables(stmt), notes=notes)
+
+
+def _delete(table: Table, *, delete_filter: str | None = None) -> bool:
+    """Run ``table.delete``; return whether any rows matched.
+
+    PyIceberg emits a ``UserWarning`` ("Delete operation did not match any
+    records") when the filter matches nothing. Under the idempotent contract
+    that's expected on re-apply, so swallow only that warning and report the
+    no-match back to the caller; any other warning is re-emitted unchanged.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if delete_filter is not None:
+            table.delete(delete_filter=delete_filter)
+        else:
+            table.delete()
+    matched = True
+    for w in caught:
+        if "did not match any records" in str(w.message):
+            matched = False
+        else:
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return matched
 
 
 def _values_to_arrow(values: exp.Values, table: Table) -> pa.Table:

@@ -8,6 +8,7 @@ tested with mocks that raise the relevant PyIceberg exception types.
 
 from __future__ import annotations
 
+import warnings
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -802,6 +803,32 @@ def test_delete_no_where_deletes_all() -> None:
     catalog.load_table.return_value = table
     dispatch(catalog, _single("DELETE FROM foo.t"))
     table.delete.assert_called_once_with()
+
+
+def test_delete_no_match_is_idempotent_note_and_swallows_warning() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    table.delete.side_effect = lambda *a, **k: warnings.warn(
+        "Delete operation did not match any records", UserWarning, stacklevel=2
+    )
+    # Promote any leaked warning to an error: the handler must swallow this one.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = dispatch(catalog, _single("DELETE FROM foo.t WHERE id = 1"))
+    assert "matched no rows (idempotent)" in result.notes
+
+
+def test_delete_reemits_unrelated_warning() -> None:
+    catalog = _make_catalog()
+    table = _make_table()
+    catalog.load_table.return_value = table
+    table.delete.side_effect = lambda *a, **k: warnings.warn(
+        "something else entirely", UserWarning, stacklevel=2
+    )
+    with pytest.warns(UserWarning, match="something else entirely"):
+        result = dispatch(catalog, _single("DELETE FROM foo.t WHERE id = 1"))
+    assert "matched no rows" not in result.notes
 
 
 # ---------------------------------------------------------------------------
